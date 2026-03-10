@@ -1,0 +1,61 @@
+@import "tailwindcss";
+
+@theme {
+  --color-dikta-bg: #0d0d0f;
+  --color-dikta-surface: #18181b;
+  --color-dikta-border: #27272a;
+  --color-dikta-muted: #71717a;
+  --color-dikta-text: #fafafa;
+  --color-dikta-primary: #10b981;
+  --color-dikta-danger: #ef4444;
+  --color-dikta-warning: #f59e0b;
+  --color-dikta-accent: #34d399;
+}
+
+/* Smooth scrollbar for settings */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #27272a; border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: #3f3f46; }
+
+/* Native select dropdown: dark text on light OS dropdown */
+select option { color: #000; background: #fff; }
+
+/*
+ * Force fully transparent background on all root elements.
+ * Critical for the floating bar window — without this, WebView2
+ * shows its default background through the transparent window.
+ */
+html, body, #root {
+  margin: 0 !important;
+  padding: 0 !important;
+  overflow: hidden !important;
+  background: transparent !important;
+  background-color: transparent !important;
+}
+
+/*
+ * Android safe-area: env(safe-area-inset-bottom) is supposed to report the
+ * height of the system navigation bar, but it returns 0 in Tauri's Android
+ * WebView. We therefore do NOT rely on it for critical layout clearances.
+ *
+ * The CSS variable is kept for informational use only; all actual clearance
+ * is handled with fixed pixel values in component styles and max-h constraints.
+ */
+:root {
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/*
+ * Mobile save-button footer: 56 px of bottom padding keeps Save buttons above
+ * the Android system nav bar (3-button ~48 px, gesture bar ~20 px on Xiaomi
+ * HyperOS). env(safe-area-inset-bottom) is NOT used here because it returns
+ * 0 in the Android WebView -- the fixed 56 px covers all known nav bar heights.
+ *
+ * Applied via isMobile check in SettingsPanel and AdvancedSettingsPanel.
+ * The parent panel max-h in App.tsx also subtracts 48 px on mobile so the
+ * footer is never clipped by the container before this padding even applies.
+ */
+.mobile-safe-bottom {
+  padding-bottom: 56px;
+}
