@@ -364,16 +364,24 @@ pub struct AppConfig {
     #[serde(default)]
     pub anthropic_api_key: String,
 
-    /// Ordered list of STT provider IDs. The first provider with a configured
-    /// API key is used. Falls back to the next in the list on missing key.
-    /// Valid values: `"groq"`, `"openai"`.
-    #[serde(default = "default_stt_priority")]
+    /// Selected STT provider.
+    /// Valid values: `"groq"`, `"openai"`, `"local"`.
+    /// Default: `"groq"`.
+    #[serde(default = "default_stt_provider")]
+    pub stt_provider: String,
+
+    /// Selected LLM cleanup provider.
+    /// Valid values: `"deepseek"`, `"openai"`, `"anthropic"`, `"groq"`.
+    /// Default: `"deepseek"`.
+    #[serde(default = "default_llm_provider")]
+    pub llm_provider: String,
+
+    // deprecated, ignored -- kept for config.json backwards compat
+    #[serde(default)]
     pub stt_priority: Vec<String>,
 
-    /// Ordered list of LLM provider IDs. The first provider with a configured
-    /// API key is used. Falls back to the next in the list on missing key.
-    /// Valid values: `"deepseek"`, `"openai"`, `"anthropic"`, `"groq"`.
-    #[serde(default = "default_llm_priority")]
+    // deprecated, ignored -- kept for config.json backwards compat
+    #[serde(default)]
     pub llm_priority: Vec<String>,
 
     /// ISO-639-1 language code used for transcription (e.g. `"de"`, `"en"`).
@@ -488,6 +496,26 @@ pub struct AppConfig {
     #[serde(default)]
     pub advanced: AdvancedSettings,
 
+    // --- Local Whisper (offline STT) ---
+
+    /// GGML model variant for offline transcription.
+    ///
+    /// The provider resolves the actual file path as:
+    /// `{app_data_dir}/models/ggml-{local_whisper_model}.bin`
+    ///
+    /// Supported values: `"tiny"`, `"tiny-q5_1"`, `"base"` (default),
+    /// `"base-q5_1"`, `"small"`, etc. See the whisper.cpp model list.
+    #[serde(default = "default_local_whisper_model")]
+    pub local_whisper_model: String,
+
+    /// Whether to enable GPU acceleration (CUDA) for local whisper inference.
+    ///
+    /// Has no effect unless the binary was compiled with the `cuda` feature.
+    /// Default is `true` so users with a GPU benefit automatically once they
+    /// enable the CUDA build.
+    #[serde(default = "default_local_whisper_gpu")]
+    pub local_whisper_gpu: bool,
+
     // --- License ---
 
     /// Validated license key string. Empty = no license.
@@ -503,17 +531,12 @@ pub struct AppConfig {
     pub license_validated_at: u64,
 }
 
-fn default_stt_priority() -> Vec<String> {
-    vec!["groq".to_string(), "openai".to_string()]
+fn default_stt_provider() -> String {
+    "groq".to_string()
 }
 
-fn default_llm_priority() -> Vec<String> {
-    vec![
-        "deepseek".to_string(),
-        "openai".to_string(),
-        "anthropic".to_string(),
-        "groq".to_string(),
-    ]
+fn default_llm_provider() -> String {
+    "deepseek".to_string()
 }
 
 fn default_language() -> String {
@@ -552,6 +575,14 @@ fn default_device_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+fn default_local_whisper_model() -> String {
+    "small".to_string()
+}
+
+fn default_local_whisper_gpu() -> bool {
+    true
+}
+
 fn default_bubble_size() -> f32 {
     1.0
 }
@@ -567,8 +598,10 @@ impl Default for AppConfig {
             deepseek_api_key: String::new(),
             openai_api_key: String::new(),
             anthropic_api_key: String::new(),
-            stt_priority: default_stt_priority(),
-            llm_priority: default_llm_priority(),
+            stt_provider: default_stt_provider(),
+            llm_provider: default_llm_provider(),
+            stt_priority: Vec::new(),
+            llm_priority: Vec::new(),
             language: default_language(),
             cleanup_style: default_cleanup_style(),
             hotkey: default_hotkey(),
@@ -590,6 +623,8 @@ impl Default for AppConfig {
             bubble_size: default_bubble_size(),
             bubble_opacity: default_bubble_opacity(),
             advanced: AdvancedSettings::default(),
+            local_whisper_model: default_local_whisper_model(),
+            local_whisper_gpu: default_local_whisper_gpu(),
             license_key: String::new(),
             license_validated_at: 0,
         }
@@ -761,8 +796,11 @@ mod tests {
         assert_eq!(cfg.cleanup_style, CleanupStyle::Polished);
         assert_eq!(cfg.hotkey, "ctrl+shift+d");
         assert_eq!(cfg.hotkey_mode, HotkeyMode::Hold);
-        assert_eq!(cfg.stt_priority, vec!["groq", "openai"]);
-        assert_eq!(cfg.llm_priority, vec!["deepseek", "openai", "anthropic", "groq"]);
+        assert_eq!(cfg.stt_provider, "groq");
+        assert_eq!(cfg.llm_provider, "deepseek");
+        // deprecated fields are empty by default
+        assert!(cfg.stt_priority.is_empty());
+        assert!(cfg.llm_priority.is_empty());
     }
 
     /// `HotkeyMode` serializes with lowercase variant names.
@@ -811,8 +849,10 @@ mod tests {
             deepseek_api_key: "ds-test-key-xyz".to_string(),
             openai_api_key: "sk-openai-test".to_string(),
             anthropic_api_key: "sk-ant-test".to_string(),
-            stt_priority: vec!["openai".to_string(), "groq".to_string()],
-            llm_priority: vec!["anthropic".to_string(), "openai".to_string()],
+            stt_provider: "openai".to_string(),
+            llm_provider: "anthropic".to_string(),
+            stt_priority: Vec::new(),
+            llm_priority: Vec::new(),
             language: "en".to_string(),
             cleanup_style: CleanupStyle::Chat,
             hotkey: "ctrl+alt+r".to_string(),
@@ -850,6 +890,8 @@ mod tests {
             device_id: "test-device".to_string(),
             bubble_size: 1.0,
             bubble_opacity: 0.85,
+            local_whisper_model: "tiny-q5_1".to_string(),
+            local_whisper_gpu: false,
             license_key: String::new(),
             license_validated_at: 0,
         };
@@ -921,52 +963,82 @@ mod tests {
         assert!(json.contains("deepseekApiKey"), "expected camelCase 'deepseekApiKey'");
         assert!(json.contains("openaiApiKey"), "expected camelCase 'openaiApiKey'");
         assert!(json.contains("anthropicApiKey"), "expected camelCase 'anthropicApiKey'");
-        assert!(json.contains("sttPriority"), "expected camelCase 'sttPriority'");
-        assert!(json.contains("llmPriority"), "expected camelCase 'llmPriority'");
+        assert!(json.contains("sttProvider"), "expected camelCase 'sttProvider'");
+        assert!(json.contains("llmProvider"), "expected camelCase 'llmProvider'");
         assert!(json.contains("cleanupStyle"), "expected camelCase 'cleanupStyle'");
         assert!(json.contains("hotkeyMode"), "expected camelCase 'hotkeyMode'");
         assert!(json.contains("sttModel"), "expected camelCase 'sttModel'");
         assert!(json.contains("customPrompt"), "expected camelCase 'customPrompt'");
     }
 
-    /// Default STT priority is groq > openai.
+    /// Default stt_provider is "groq".
     #[test]
-    fn test_default_stt_priority() {
+    fn test_default_stt_provider() {
         let cfg = AppConfig::default();
-        assert_eq!(cfg.stt_priority, vec!["groq", "openai"]);
+        assert_eq!(cfg.stt_provider, "groq");
     }
 
-    /// Default LLM priority is deepseek > openai > anthropic > groq.
+    /// Default llm_provider is "deepseek".
     #[test]
-    fn test_default_llm_priority() {
+    fn test_default_llm_provider() {
         let cfg = AppConfig::default();
-        assert_eq!(cfg.llm_priority, vec!["deepseek", "openai", "anthropic", "groq"]);
+        assert_eq!(cfg.llm_provider, "deepseek");
     }
 
-    /// Priority lists round-trip through save/load.
+    /// stt_provider and llm_provider round-trip through save/load.
     #[test]
-    fn test_priority_lists_roundtrip() {
+    fn test_provider_fields_roundtrip() {
         let dir = temp_dir();
         let cfg = AppConfig {
-            stt_priority: vec!["openai".to_string()],
-            llm_priority: vec!["anthropic".to_string(), "deepseek".to_string()],
+            stt_provider: "openai".to_string(),
+            llm_provider: "anthropic".to_string(),
             ..AppConfig::default()
         };
         save_config(dir.path(), &cfg).unwrap();
         let loaded = load_config(dir.path());
-        assert_eq!(loaded.stt_priority, cfg.stt_priority);
-        assert_eq!(loaded.llm_priority, cfg.llm_priority);
+        assert_eq!(loaded.stt_provider, "openai");
+        assert_eq!(loaded.llm_provider, "anthropic");
     }
 
-    /// Partial JSON with no priority fields fills in defaults.
+    /// Partial JSON without provider fields uses defaults ("groq", "deepseek").
     #[test]
-    fn test_partial_json_fills_priority_defaults() {
+    fn test_partial_json_fills_provider_defaults() {
         let dir = temp_dir();
         let partial = r#"{"language": "de"}"#;
         std::fs::write(dir.path().join("config.json"), partial.as_bytes()).unwrap();
         let cfg = load_config(dir.path());
-        assert_eq!(cfg.stt_priority, vec!["groq", "openai"]);
-        assert_eq!(cfg.llm_priority, vec!["deepseek", "openai", "anthropic", "groq"]);
+        assert_eq!(cfg.stt_provider, "groq");
+        assert_eq!(cfg.llm_provider, "deepseek");
+    }
+
+    /// Old config.json with stt_priority/llm_priority but no provider fields
+    /// loads without error and fills in defaults for the new provider fields.
+    #[test]
+    fn test_old_config_with_priority_fields_loads_with_provider_defaults() {
+        let dir = temp_dir();
+        // Simulate a legacy config.json that has the old priority lists but no new fields.
+        let legacy = r#"{
+            "language": "de",
+            "sttPriority": ["openai", "groq"],
+            "llmPriority": ["anthropic", "openai"]
+        }"#;
+        std::fs::write(dir.path().join("config.json"), legacy.as_bytes()).unwrap();
+        let cfg = load_config(dir.path());
+        // New fields default to their own defaults -- old fields are not promoted.
+        assert_eq!(cfg.stt_provider, "groq", "legacy config should get stt_provider default");
+        assert_eq!(cfg.llm_provider, "deepseek", "legacy config should get llm_provider default");
+        // Old fields are still present in the struct (kept for compat) but we don't use them.
+        assert_eq!(cfg.stt_priority, vec!["openai", "groq"]);
+        assert_eq!(cfg.llm_priority, vec!["anthropic", "openai"]);
+    }
+
+    /// Provider fields serialize with camelCase keys.
+    #[test]
+    fn test_provider_fields_serialize_camel_case() {
+        let cfg = AppConfig::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("sttProvider"), "expected camelCase 'sttProvider'");
+        assert!(json.contains("llmProvider"), "expected camelCase 'llmProvider'");
     }
 
     /// Default STT model is whisper-large-v3-turbo.
@@ -1317,5 +1389,68 @@ mod tests {
         let cfg = AppConfig::default();
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(json.contains("\"advanced\""), "AppConfig should serialize an 'advanced' key");
+    }
+
+    // --- local_whisper field tests ---
+
+    /// Default `local_whisper_model` is `"small"`.
+    #[test]
+    fn test_default_local_whisper_model_is_small() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.local_whisper_model, "small");
+    }
+
+    /// Default `local_whisper_gpu` is `true`.
+    #[test]
+    fn test_default_local_whisper_gpu_is_true() {
+        let cfg = AppConfig::default();
+        assert!(cfg.local_whisper_gpu, "default local_whisper_gpu should be true");
+    }
+
+    /// `local_whisper_model` and `local_whisper_gpu` round-trip through save/load.
+    #[test]
+    fn test_local_whisper_fields_roundtrip() {
+        let dir = temp_dir();
+        let cfg = AppConfig {
+            local_whisper_model: "tiny-q5_1".to_string(),
+            local_whisper_gpu: false,
+            ..AppConfig::default()
+        };
+        save_config(dir.path(), &cfg).expect("save should succeed");
+        let loaded = load_config(dir.path());
+        assert_eq!(loaded.local_whisper_model, "tiny-q5_1");
+        assert!(!loaded.local_whisper_gpu);
+    }
+
+    /// Partial JSON without `localWhisperModel` fills in the default.
+    #[test]
+    fn test_partial_json_local_whisper_model_defaults_to_small() {
+        let dir = temp_dir();
+        let partial = r#"{"language": "de"}"#;
+        std::fs::write(dir.path().join("config.json"), partial.as_bytes()).unwrap();
+        let cfg = load_config(dir.path());
+        assert_eq!(
+            cfg.local_whisper_model, "small",
+            "missing localWhisperModel should default to 'small'"
+        );
+        assert!(
+            cfg.local_whisper_gpu,
+            "missing localWhisperGpu should default to true"
+        );
+    }
+
+    /// Config serializes local_whisper fields with camelCase keys.
+    #[test]
+    fn test_local_whisper_fields_serialize_camel_case() {
+        let cfg = AppConfig::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            json.contains("localWhisperModel"),
+            "expected camelCase 'localWhisperModel'"
+        );
+        assert!(
+            json.contains("localWhisperGpu"),
+            "expected camelCase 'localWhisperGpu'"
+        );
     }
 }

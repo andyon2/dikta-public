@@ -1,10 +1,40 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { getVersion } from "@tauri-apps/api/app";
-import { openUrl } from "@tauri-apps/plugin-opener";
-import { check } from "@tauri-apps/plugin-updater";
-import { DndContext, closestCenter, PointerSensor, useSensor, useSensors, type DragEndEvent } from "@dnd-kit/core";
-import { SortableContext, verticalListSortingStrategy, useSortable, arrayMove } from "@dnd-kit/sortable";
-import { CSS } from "@dnd-kit/utilities";
+import { isPreviewMode } from "../tauri-commands";
+
+// Plugin imports are loaded dynamically so that this module can be evaluated
+// in a plain browser (preview mode) without crashing on missing Tauri globals.
+
+/** Returns the app version string. Falls back to a hardcoded string in preview mode. */
+async function getAppVersion(): Promise<string> {
+  if (isPreviewMode) return "0.4.1-preview";
+  try {
+    const { getVersion } = await import("@tauri-apps/api/app");
+    return getVersion();
+  } catch {
+    return "0.4.1";
+  }
+}
+
+/** Opens a URL in the system browser. Falls back to window.open in preview mode. */
+async function openUrl(url: string): Promise<void> {
+  try {
+    const { openUrl: tauriOpenUrl } = await import("@tauri-apps/plugin-opener");
+    await tauriOpenUrl(url);
+  } catch {
+    window.open(url, "_blank", "noopener,noreferrer");
+  }
+}
+
+/** Checks for app updates. Returns null in preview mode. */
+async function checkForUpdate(): Promise<{ version: string; downloadAndInstall: () => Promise<void> } | null> {
+  if (isPreviewMode) return null;
+  try {
+    const { check } = await import("@tauri-apps/plugin-updater");
+    return check();
+  } catch {
+    return null;
+  }
+}
 import type { AppSettings, CleanupStyle, HotkeyMode, AppProfile, ParsedLicenseStatus } from "../types";
 import { STYLE_OPTIONS } from "../types";
 import { getProfiles, saveProfiles, syncHistory } from "../tauri-commands";
@@ -12,6 +42,7 @@ import { isDesktop, isMobile } from "../platform";
 import { CloseIcon, LockIcon } from "./icons";
 import { StatusDot, DictionaryTag, INPUT_CLS, LABEL_CLS, SECTION_TITLE_CLS, INPUT_CLS_M, LABEL_CLS_M } from "./ui";
 import { MobileTextarea } from "./MobileTextarea";
+import { WhisperModelManager } from "./WhisperModelManager";
 
 // --- Shortcut Recorder -------------------------------------------------------
 
@@ -63,137 +94,13 @@ function ShortcutRecorder({ value, onChange }: { value: string; onChange: (s: st
   );
 }
 
-// --- Drag-and-drop provider priority -----------------------------------------
+// --- Cloud STT models ---------------------------------------------------------
 
-function SortableProviderItem({ id, label, active }: { id: string; label: string; active: boolean }) {
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id });
-  const style = {
-    transform: CSS.Transform.toString(transform),
-    transition,
-    opacity: isDragging ? 0.5 : 1,
-  };
-  return (
-    <div
-      ref={setNodeRef}
-      style={style}
-      {...attributes}
-      {...listeners}
-      className={[
-        "flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs cursor-grab active:cursor-grabbing select-none",
-        "bg-[#111113] border",
-        active ? "border-emerald-500/30 text-zinc-200" : "border-zinc-800/40 text-zinc-500",
-      ].join(" ")}
-    >
-      <svg viewBox="0 0 16 16" className="w-3 h-3 text-zinc-600 flex-shrink-0" fill="currentColor">
-        <circle cx="5" cy="4" r="1.2" /><circle cx="11" cy="4" r="1.2" />
-        <circle cx="5" cy="8" r="1.2" /><circle cx="11" cy="8" r="1.2" />
-        <circle cx="5" cy="12" r="1.2" /><circle cx="11" cy="12" r="1.2" />
-      </svg>
-      <span className="flex-1">{label}</span>
-      <span className={["w-1.5 h-1.5 rounded-full flex-shrink-0", active ? "bg-emerald-400" : "bg-zinc-700"].join(" ")} />
-    </div>
-  );
-}
-
-/** Mobile-only row with Up/Down buttons instead of drag handle. */
-function MobileProviderItem({
-  label, active, onUp, onDown, isFirst, isLast,
-}: {
-  label: string; active: boolean; onUp: () => void; onDown: () => void; isFirst: boolean; isLast: boolean;
-}) {
-  return (
-    <div className={[
-      "flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm",
-      "bg-[#111113] border",
-      active ? "border-emerald-500/30 text-zinc-200" : "border-zinc-800/40 text-zinc-500",
-    ].join(" ")}>
-      <span className="flex-1">{label}</span>
-      <span className={["w-2 h-2 rounded-full flex-shrink-0", active ? "bg-emerald-400" : "bg-zinc-700"].join(" ")} />
-      <button
-        onClick={onUp}
-        disabled={isFirst}
-        aria-label="Move up"
-        className="min-w-[36px] min-h-[36px] flex items-center justify-center rounded-lg text-zinc-400 hover:text-zinc-100 hover:bg-zinc-700/50 disabled:opacity-20 disabled:cursor-not-allowed transition-colors"
-      >
-        <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
-          <path d="M18 15l-6-6-6 6" />
-        </svg>
-      </button>
-      <button
-        onClick={onDown}
-        disabled={isLast}
-        aria-label="Move down"
-        className="min-w-[36px] min-h-[36px] flex items-center justify-center rounded-lg text-zinc-400 hover:text-zinc-100 hover:bg-zinc-700/50 disabled:opacity-20 disabled:cursor-not-allowed transition-colors"
-      >
-        <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
-          <path d="M6 9l6 6 6-6" />
-        </svg>
-      </button>
-    </div>
-  );
-}
-
-function ProviderPriorityList({
-  items, onChange, keyStatus, labels,
-}: {
-  items: string[];
-  onChange: (items: string[]) => void;
-  keyStatus: Record<string, boolean>;
-  labels: Record<string, string>;
-}) {
-  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
-
-  function handleDragEnd(event: DragEndEvent) {
-    const { active, over } = event;
-    if (over && active.id !== over.id) {
-      const oldIdx = items.indexOf(active.id as string);
-      const newIdx = items.indexOf(over.id as string);
-      onChange(arrayMove(items, oldIdx, newIdx));
-    }
-  }
-
-  function moveItem(index: number, direction: -1 | 1) {
-    const newIdx = index + direction;
-    if (newIdx < 0 || newIdx >= items.length) return;
-    onChange(arrayMove(items, index, newIdx));
-  }
-
-  // On mobile, show Up/Down buttons instead of drag handles.
-  if (isMobile) {
-    return (
-      <div className="flex flex-col gap-1.5">
-        {items.map((id, i) => (
-          <MobileProviderItem
-            key={id}
-            label={labels[id] ?? id}
-            active={!!keyStatus[id]}
-            onUp={() => moveItem(i, -1)}
-            onDown={() => moveItem(i, 1)}
-            isFirst={i === 0}
-            isLast={i === items.length - 1}
-          />
-        ))}
-      </div>
-    );
-  }
-
-  return (
-    <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
-      <SortableContext items={items} strategy={verticalListSortingStrategy}>
-        <div className="flex flex-col gap-1">
-          {items.map((id) => (
-            <SortableProviderItem
-              key={id}
-              id={id}
-              label={labels[id] ?? id}
-              active={!!keyStatus[id]}
-            />
-          ))}
-        </div>
-      </SortableContext>
-    </DndContext>
-  );
-}
+const CLOUD_STT_MODELS = [
+  { value: "whisper-large-v3-turbo", label: "Groq — Large V3 Turbo", price: "~$0.0007/min", provider: "groq" },
+  { value: "whisper-large-v3", label: "Groq — Large V3", price: "~$0.002/min", provider: "groq" },
+  { value: "whisper-1", label: "OpenAI — Whisper 1", price: "~$0.006/min", provider: "openai" },
+];
 
 // --- Output language options --------------------------------------------------
 
@@ -224,7 +131,7 @@ function UpdateChecker() {
     setStatus("checking");
     setErrorMsg(null);
     try {
-      const update = await check();
+      const update = await checkForUpdate();
       if (update) {
         setUpdateVersion(update.version);
         setStatus("available");
@@ -241,7 +148,7 @@ function UpdateChecker() {
   const handleInstall = useCallback(async () => {
     setStatus("downloading");
     try {
-      const update = await check();
+      const update = await checkForUpdate();
       if (update) {
         await update.downloadAndInstall();
       }
@@ -310,15 +217,15 @@ function formatGraceDate(timestamp: number): string {
 }
 
 const LOCKED_FEATURES = [
-  "All Providers",
-  "Cleanup Styles",
+  "Offline HD Models",
   "Command Mode",
   "Snippets",
-  "Profiles",
+  "Unlimited Dictionary",
   "Voice Notes",
-  "Sync",
-  "Offline Mode",
-  "Analytics",
+  "Live Transcription",
+  "Cleanup Instructions",
+  "Cross-Device Sync",
+  "Advanced Statistics",
 ];
 
 interface LicenseSectionProps {
@@ -370,6 +277,7 @@ function LicenseSection({ licenseStatus, onValidate, onRemove, licenseLoading }:
   }, []);
 
   const isLicensed = licenseStatus.type === "licensed";
+  const isTrial = licenseStatus.type === "trial";
   const isGrace = licenseStatus.type === "grace_period";
   const isUnlicensed = licenseStatus.type === "unlicensed";
 
@@ -383,6 +291,13 @@ function LicenseSection({ licenseStatus, onValidate, onRemove, licenseLoading }:
               <path d="M20 6L9 17l-5-5" />
             </svg>
             Licensed
+          </span>
+        )}
+        {isTrial && (
+          <span className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium bg-blue-500/15 text-blue-400">
+            {isPreviewMode
+              ? "Trial — Preview Mode"
+              : `Trial${licenseStatus.trialUntil ? ` — expires ${formatGraceDate(licenseStatus.trialUntil)}` : ""}`}
           </span>
         )}
         {isGrace && (
@@ -401,6 +316,24 @@ function LicenseSection({ licenseStatus, onValidate, onRemove, licenseLoading }:
       {isLicensed && (
         <>
           <p className={isMobile ? "text-sm text-zinc-300" : "text-xs text-zinc-300"}>All features unlocked.</p>
+          <button
+            onClick={handleRemoveClick}
+            disabled={licenseLoading}
+            className={[
+              "self-start transition-colors disabled:opacity-40",
+              isMobile ? "text-sm" : "text-[11px]",
+              confirmRemove ? "text-red-400 hover:text-red-300" : "text-zinc-500 hover:text-zinc-300",
+            ].join(" ")}
+          >
+            {confirmRemove ? "Click again to confirm removal" : "Remove License"}
+          </button>
+        </>
+      )}
+
+      {/* Trial state */}
+      {isTrial && (
+        <>
+          <p className={isMobile ? "text-sm text-zinc-300" : "text-xs text-zinc-300"}>All features unlocked during trial.</p>
           <button
             onClick={handleRemoveClick}
             disabled={licenseLoading}
@@ -489,7 +422,7 @@ function LicenseKeyInput({
           value={value}
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && !loading && onActivate()}
-          maxLength={24} // DIKTA(5) + 4 dashes + 16 chars
+          maxLength={25} // DIKTA(5) + 4 dashes + 16 chars = 25
           className={[
             "flex-1 font-mono tracking-widest",
             isMobile ? INPUT_CLS_M : INPUT_CLS,
@@ -537,9 +470,11 @@ export interface SettingsPanelProps {
     groqKey: string, deepseekKey: string, lang: string, style: CleanupStyle,
     hotkey: string, hotkeyMode: HotkeyMode, audioDevice: string | null,
     sttModel: string, customPrompt: string, autostart: boolean, whisperMode: boolean,
-    openaiKey: string, anthropicKey: string, sttPriority: string[], llmPriority: string[],
+    openaiKey: string, anthropicKey: string,
     outputLanguage: string, webhookUrl: string, tursoUrl: string, tursoToken: string,
     bubbleSize?: number | null, bubbleOpacity?: number | null,
+    localWhisperModel?: string | null, localWhisperGpu?: boolean | null,
+    sttProvider?: string | null, llmProvider?: string | null,
   ) => Promise<void>;
   onLanguageChange: (lang: string) => void;
   onStyleChange: (style: CleanupStyle) => void;
@@ -571,8 +506,8 @@ export function SettingsPanel({
   const [localWhisperMode, setLocalWhisperMode] = useState(loadedSettings?.whisperMode ?? false);
   const [openaiKey, setOpenaiKey] = useState("");
   const [anthropicKey, setAnthropicKey] = useState("");
-  const [localSttPriority, setLocalSttPriority] = useState<string[]>(loadedSettings?.sttPriority ?? ["groq", "openai"]);
-  const [localLlmPriority, setLocalLlmPriority] = useState<string[]>(loadedSettings?.llmPriority ?? ["deepseek", "openai", "anthropic", "groq"]);
+  const [localSttProvider, setLocalSttProvider] = useState<string>(loadedSettings?.sttProvider ?? "groq");
+  const [localLlmProvider, setLocalLlmProvider] = useState<string>(loadedSettings?.llmProvider ?? "deepseek");
   const [localOutputLanguage, setLocalOutputLanguage] = useState(outputLanguage);
   useEffect(() => { setLocalOutputLanguage(outputLanguage); }, [outputLanguage]);
   const [localWebhookUrl, setLocalWebhookUrl] = useState(loadedSettings?.webhookUrl ?? "");
@@ -580,6 +515,8 @@ export function SettingsPanel({
   const [tursoToken, setTursoToken] = useState("");
   const [localBubbleSize, setLocalBubbleSize] = useState(loadedSettings?.bubbleSize ?? 1.0);
   const [localBubbleOpacity, setLocalBubbleOpacity] = useState(loadedSettings?.bubbleOpacity ?? 0.85);
+  const [localWhisperModel, setLocalWhisperModel] = useState(loadedSettings?.localWhisperModel ?? "small");
+  const [localWhisperGpu, setLocalWhisperGpu] = useState(loadedSettings?.localWhisperGpu ?? true);
   const [syncing, setSyncing] = useState(false);
   const [syncMsg, setSyncMsg] = useState<string | null>(null);
   const [profiles, setProfiles] = useState<AppProfile[]>([]);
@@ -587,6 +524,9 @@ export function SettingsPanel({
   const [saveMsg, setSaveMsg] = useState<string | null>(null);
   const [newTerm, setNewTerm] = useState("");
   const [appVersion, setAppVersion] = useState<string>("");
+  // isDirty: true when any local state differs from the persisted loadedSettings.
+  // License activation must NOT set this flag (it auto-saves immediately).
+  const [isDirty, setIsDirty] = useState(false);
   // Accordion: only one section open at a time. First section open by default.
   const [openSections, setOpenSections] = useState<Record<string, boolean>>({
     voiceRecording: true,
@@ -605,7 +545,7 @@ export function SettingsPanel({
   useEffect(() => { getProfiles().then(setProfiles).catch(console.error); }, []);
 
   // Load app version on mount.
-  useEffect(() => { getVersion().then(setAppVersion).catch(() => setAppVersion("0.4.1")); }, []);
+  useEffect(() => { getAppVersion().then(setAppVersion).catch(() => setAppVersion("0.4.1")); }, []);
 
   useEffect(() => { setLocalLang(language); }, [language]);
   useEffect(() => { setLocalStyle(cleanupStyle); }, [cleanupStyle]);
@@ -618,15 +558,55 @@ export function SettingsPanel({
       setLocalCustomPrompt(loadedSettings.customPrompt);
       setLocalAutostart(loadedSettings.autostart);
       setLocalWhisperMode(loadedSettings.whisperMode);
-      setLocalSttPriority(loadedSettings.sttPriority);
-      setLocalLlmPriority(loadedSettings.llmPriority);
+      setLocalSttProvider(loadedSettings.sttProvider ?? "groq");
+      setLocalLlmProvider(loadedSettings.llmProvider ?? "deepseek");
       setLocalOutputLanguage(loadedSettings.outputLanguage ?? "");
       setLocalWebhookUrl(loadedSettings.webhookUrl ?? "");
       setLocalTursoUrl(loadedSettings.tursoUrl ?? "");
       setLocalBubbleSize(loadedSettings.bubbleSize ?? 1.0);
       setLocalBubbleOpacity(loadedSettings.bubbleOpacity ?? 0.85);
+      setLocalWhisperModel(loadedSettings.localWhisperModel ?? "small");
+      setLocalWhisperGpu(loadedSettings.localWhisperGpu ?? true);
     }
   }, [loadedSettings]);
+
+  // Track dirty state: compare local values against the last saved settings.
+  // API key fields: any non-empty input counts as dirty (new key to save).
+  // License activation is excluded -- it triggers auto-save and must not set dirty.
+  useEffect(() => {
+    if (!loadedSettings) return;
+    const dirty =
+      localLang !== (loadedSettings.language ?? "") ||
+      localStyle !== (loadedSettings.cleanupStyle ?? "polished") ||
+      localHotkey !== (loadedSettings.hotkey ?? "") ||
+      localHotkeyMode !== (loadedSettings.hotkeyMode ?? "hold") ||
+      localAudioDevice !== (loadedSettings.audioDevice ?? null) ||
+      localSttModel !== (loadedSettings.sttModel ?? "whisper-large-v3-turbo") ||
+      localCustomPrompt !== (loadedSettings.customPrompt ?? "") ||
+      localAutostart !== (loadedSettings.autostart ?? false) ||
+      localWhisperMode !== (loadedSettings.whisperMode ?? false) ||
+      localSttProvider !== (loadedSettings.sttProvider ?? "groq") ||
+      localLlmProvider !== (loadedSettings.llmProvider ?? "deepseek") ||
+      localOutputLanguage !== (loadedSettings.outputLanguage ?? "") ||
+      localWebhookUrl !== (loadedSettings.webhookUrl ?? "") ||
+      localTursoUrl !== (loadedSettings.tursoUrl ?? "") ||
+      localBubbleSize !== (loadedSettings.bubbleSize ?? 1.0) ||
+      localBubbleOpacity !== (loadedSettings.bubbleOpacity ?? 0.85) ||
+      localWhisperModel !== (loadedSettings.localWhisperModel ?? "small") ||
+      localWhisperGpu !== (loadedSettings.localWhisperGpu ?? true) ||
+      groqKey.trim() !== "" ||
+      deepseekKey.trim() !== "" ||
+      openaiKey.trim() !== "" ||
+      anthropicKey.trim() !== "" ||
+      tursoToken.trim() !== "";
+    setIsDirty(dirty);
+  }, [
+    loadedSettings, localLang, localStyle, localHotkey, localHotkeyMode, localAudioDevice,
+    localSttModel, localCustomPrompt, localAutostart, localWhisperMode, localSttProvider,
+    localLlmProvider, localOutputLanguage, localWebhookUrl, localTursoUrl, localBubbleSize,
+    localBubbleOpacity, localWhisperModel, localWhisperGpu,
+    groqKey, deepseekKey, openaiKey, anthropicKey, tursoToken,
+  ]);
 
   // Close on Escape.
   useEffect(() => {
@@ -665,33 +645,72 @@ export function SettingsPanel({
     onAudioDeviceChange(d);
   }, [onAudioDeviceChange]);
 
-  const handleSave = useCallback(async () => {
+  // Internal helper: calls onSave with all current values. Used by both the
+  // explicit Save button and the auto-save after license activation.
+  const saveCurrentSettings = useCallback(async (opts?: { silent?: boolean }) => {
     setSaving(true);
-    setSaveMsg(null);
+    if (!opts?.silent) setSaveMsg(null);
     try {
       await onSave(
         groqKey.trim(), deepseekKey.trim(), localLang, localStyle, localHotkey, localHotkeyMode,
         localAudioDevice, localSttModel, localCustomPrompt, localAutostart, localWhisperMode,
-        openaiKey.trim(), anthropicKey.trim(), localSttPriority, localLlmPriority,
+        openaiKey.trim(), anthropicKey.trim(),
         localOutputLanguage, localWebhookUrl.trim(), localTursoUrl.trim(), tursoToken.trim(),
         localBubbleSize, localBubbleOpacity,
+        localWhisperModel, localWhisperGpu,
+        localSttProvider, localLlmProvider,
       );
       setGroqKey("");
       setDeepseekKey("");
       setOpenaiKey("");
       setAnthropicKey("");
       setTursoToken("");
-      setSaveMsg("Saved");
-      setTimeout(() => setSaveMsg(null), 2000);
+      if (!opts?.silent) {
+        setSaveMsg("Saved");
+        setTimeout(() => setSaveMsg(null), 2000);
+      }
     } catch (err) {
-      setSaveMsg(err instanceof Error ? err.message : String(err));
+      if (!opts?.silent) setSaveMsg(err instanceof Error ? err.message : String(err));
     } finally {
       setSaving(false);
     }
   }, [
     groqKey, deepseekKey, localLang, localStyle, localHotkey, localHotkeyMode, localAudioDevice,
     localSttModel, localCustomPrompt, localAutostart, localWhisperMode, openaiKey, anthropicKey,
-    localSttPriority, localLlmPriority, localOutputLanguage, localWebhookUrl, localTursoUrl, tursoToken, onSave,
+    localSttProvider, localLlmProvider, localOutputLanguage, localWebhookUrl, localTursoUrl, tursoToken,
+    localBubbleSize, localBubbleOpacity, localWhisperModel, localWhisperGpu, onSave,
+  ]);
+
+  const handleSave = useCallback(async () => {
+    await saveCurrentSettings();
+  }, [saveCurrentSettings]);
+
+  // Called from LicenseSection after successful activation: persist immediately
+  // so the user never has to click Save Settings for license changes.
+  // We do NOT want to mark this as a dirty operation -- use silent mode and
+  // pass empty strings for API keys (backend ignores them when empty).
+  const handleLicenseAutoSave = useCallback(async () => {
+    setSaving(true);
+    try {
+      await onSave(
+        "", "", localLang, localStyle, localHotkey, localHotkeyMode,
+        localAudioDevice, localSttModel, localCustomPrompt, localAutostart, localWhisperMode,
+        "", "",
+        localOutputLanguage, localWebhookUrl.trim(), localTursoUrl.trim(), "",
+        localBubbleSize, localBubbleOpacity,
+        localWhisperModel, localWhisperGpu,
+        localSttProvider, localLlmProvider,
+      );
+    } catch (err) {
+      console.error("License auto-save failed:", err);
+    } finally {
+      setSaving(false);
+    }
+  }, [
+    localLang, localStyle, localHotkey, localHotkeyMode, localAudioDevice,
+    localSttModel, localCustomPrompt, localAutostart, localWhisperMode,
+    localSttProvider, localLlmProvider, localOutputLanguage, localWebhookUrl, localTursoUrl,
+    localBubbleSize, localBubbleOpacity, localWhisperModel, localWhisperGpu, onSave,
   ]);
 
   const handleAddTerm = useCallback(async () => {
@@ -710,9 +729,12 @@ export function SettingsPanel({
   const openaiOk = !!loadedSettings?.openaiApiKeyMasked;
   const anthropicOk = !!loadedSettings?.anthropicApiKeyMasked;
 
-  // Feature gate: user has an active paid license (licensed or valid grace period).
+  // Feature gate: user has an active paid license (licensed, active trial, or valid grace period).
   const isPaid =
     licenseStatus.type === "licensed" ||
+    (licenseStatus.type === "trial" &&
+      licenseStatus.trialUntil !== undefined &&
+      licenseStatus.trialUntil > Date.now() / 1000) ||
     (licenseStatus.type === "grace_period" &&
       licenseStatus.graceUntil !== undefined &&
       licenseStatus.graceUntil > Date.now() / 1000);
@@ -749,18 +771,137 @@ export function SettingsPanel({
           </button>
           {openSections.voiceRecording && (
             <div className="flex flex-col gap-3 pl-4 pb-3 pt-1">
-              {/* Microphone -- desktop only (Android uses its own mic via MediaRecorder) */}
-              {isDesktop && (
-                <div className="flex items-center justify-between gap-3">
-                  <span className={LABEL_CLS_M}>Microphone</span>
-                  <select
-                    value={localAudioDevice ?? ""}
-                    onChange={(e) => handleAudioDeviceChange(e.target.value || null)}
-                    className="bg-[#111113] border border-zinc-800/60 rounded-lg px-2.5 py-1.5 text-xs text-zinc-200 max-w-[180px] truncate focus:outline-none focus:border-emerald-500/40 transition-colors cursor-pointer"
+
+              {/* Cloud / Offline toggle -- same visual style as StylePicker */}
+              <div className="flex flex-col gap-2">
+                <span className="text-xs font-semibold text-zinc-400 uppercase tracking-wide">Speech Recognition</span>
+                <div className="flex flex-col gap-2 pl-0">
+                <div className="flex gap-0.5 bg-[#111113] rounded-lg p-0.5 border border-zinc-800/60 w-fit">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (localSttProvider === "local") {
+                        setLocalSttProvider("groq");
+                      }
+                    }}
+                    className={[
+                      "px-3 py-1.5 rounded-md text-xs font-medium transition-all duration-100",
+                      localSttProvider !== "local"
+                        ? "bg-emerald-500/15 text-emerald-400"
+                        : "text-zinc-500 hover:text-zinc-300",
+                    ].join(" ")}
                   >
-                    <option value="">System Default</option>
-                    {audioDevices.map((n) => <option key={n} value={n}>{n}</option>)}
-                  </select>
+                    Cloud
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setLocalSttProvider("local")}
+                    className={[
+                      "px-3 py-1.5 rounded-md text-xs font-medium transition-all duration-100",
+                      localSttProvider === "local"
+                        ? "bg-emerald-500/15 text-emerald-400"
+                        : "text-zinc-500 hover:text-zinc-300",
+                    ].join(" ")}
+                  >
+                    Offline
+                  </button>
+                </div>
+
+                {/* Cloud mode: model picker */}
+                {localSttProvider !== "local" && (
+                  <div className="flex flex-col gap-2 mt-1">
+                    <div className={`flex gap-3 ${isMobile ? "flex-col" : "items-center justify-between"}`}>
+                      <span className={LABEL_CLS_M}>Model</span>
+                      <select
+                        value={localSttModel}
+                        onChange={(e) => {
+                          const model = e.target.value;
+                          setLocalSttModel(model);
+                          // Sync provider to match the selected model's API.
+                          if (model === "whisper-1") {
+                            setLocalSttProvider("openai");
+                          } else {
+                            setLocalSttProvider("groq");
+                          }
+                        }}
+                        className={`bg-[#111113] border border-zinc-800/60 rounded-lg px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-emerald-500/40 transition-colors cursor-pointer ${isMobile ? "w-full" : ""}`}
+                      >
+                        {CLOUD_STT_MODELS.filter((m) => {
+                          if (m.provider === "groq") return groqOk;
+                          if (m.provider === "openai") return openaiOk;
+                          return true;
+                        }).map((m) => (
+                          <option key={m.value} value={m.value}>
+                            {m.label} ({m.price})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                )}
+
+                {/* Offline mode: WhisperModelManager */}
+                {localSttProvider === "local" && isDesktop && (
+                  <div className="flex flex-col gap-3 mt-1">
+                    <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-zinc-800/30 border border-zinc-700/30">
+                      <svg className="w-3.5 h-3.5 text-zinc-400 mt-0.5 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <circle cx="12" cy="12" r="10" /><path d="M12 16v-4M12 8h.01" />
+                      </svg>
+                      <p className="text-[11px] text-zinc-400 leading-relaxed">
+                        Speech is transcribed locally. Text cleanup is skipped (no internet needed).
+                      </p>
+                    </div>
+                    <WhisperModelManager
+                      selectedModel={localWhisperModel}
+                      gpuEnabled={localWhisperGpu}
+                      onModelChange={setLocalWhisperModel}
+                      onGpuChange={setLocalWhisperGpu}
+                      isPaid={isPaid}
+                    />
+                  </div>
+                )}
+                </div>
+              </div>
+
+              {/* Text Cleanup -- only in Cloud mode */}
+              {localSttProvider !== "local" && (
+                <div className="flex flex-col gap-2.5">
+                  <span className="text-xs font-semibold text-zinc-400 uppercase tracking-wide">Text Cleanup</span>
+
+                  <div className={`flex gap-3 ${isMobile ? "flex-col" : "items-center justify-between"}`}>
+                    <span className={LABEL_CLS_M}>Provider</span>
+                    <select
+                      value={localLlmProvider}
+                      onChange={(e) => setLocalLlmProvider(e.target.value)}
+                      className={`bg-[#111113] border border-zinc-800/60 rounded-lg px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-emerald-500/40 transition-colors cursor-pointer ${isMobile ? "w-full" : ""}`}
+                    >
+                      <option value="deepseek" disabled={!deepseekOk}>DeepSeek{!deepseekOk ? " (no key)" : ""}</option>
+                      <option value="openai" disabled={!openaiOk}>OpenAI{!openaiOk ? " (no key)" : ""}</option>
+                      <option value="anthropic" disabled={!anthropicOk}>Anthropic{!anthropicOk ? " (no key)" : ""}</option>
+                      <option value="groq" disabled={!groqOk}>Groq (Llama){!groqOk ? " (no key)" : ""}</option>
+                    </select>
+                  </div>
+
+                  <div className={`flex gap-3 ${isMobile ? "flex-col" : "items-center justify-between"}`}>
+                    <span className={LABEL_CLS_M}>Style</span>
+                    <div className="flex gap-0.5 bg-[#111113] rounded-lg p-0.5 border border-zinc-800/60">
+                      {STYLE_OPTIONS.map((opt) => (
+                        <button
+                          key={opt.value}
+                          onClick={() => handleStyleChange(opt.value)}
+                          title={opt.description}
+                          className={[
+                            isMobile ? "flex-1 px-3 py-2 rounded-md text-sm font-medium transition-all duration-100" : "px-2 py-1 rounded-md text-xs font-medium transition-all duration-100",
+                            localStyle === opt.value
+                              ? "bg-emerald-500/15 text-emerald-400"
+                              : "text-zinc-500 hover:text-zinc-300",
+                          ].join(" ")}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
                 </div>
               )}
 
@@ -792,49 +933,20 @@ export function SettingsPanel({
                 </select>
               </div>
 
-              {/* Cleanup style */}
-              <div className={`flex gap-3 ${isMobile ? "flex-col" : "items-center justify-between"}`}>
-                <span className={LABEL_CLS_M}>Cleanup Style</span>
-                <div className="flex gap-0.5 bg-[#111113] rounded-lg p-0.5 border border-zinc-800/60">
-                  {STYLE_OPTIONS.map((opt) => {
-                    const locked = !isPaid && opt.value !== "polished";
-                    return (
-                      <button
-                        key={opt.value}
-                        onClick={() => { if (!locked) handleStyleChange(opt.value); }}
-                        title={locked ? "Requires Dikta License" : opt.description}
-                        disabled={locked}
-                        className={[
-                          isMobile ? "flex-1 px-3 py-2 rounded-md text-sm font-medium transition-all duration-100" : "px-2 py-1 rounded-md text-xs font-medium transition-all duration-100",
-                          locked ? "opacity-50 cursor-not-allowed" : "",
-                          localStyle === opt.value
-                            ? "bg-emerald-500/15 text-emerald-400"
-                            : "text-zinc-500 hover:text-zinc-300",
-                        ].join(" ")}
-                      >
-                        <span className="flex items-center gap-1 justify-center">
-                          {opt.label}
-                          {locked && <LockIcon className="w-2.5 h-2.5 text-zinc-600" />}
-                        </span>
-                      </button>
-                    );
-                  })}
+              {/* Microphone -- desktop only (Android uses its own mic via MediaRecorder) */}
+              {isDesktop && (
+                <div className="flex items-center justify-between gap-3">
+                  <span className={LABEL_CLS_M}>Microphone</span>
+                  <select
+                    value={localAudioDevice ?? ""}
+                    onChange={(e) => handleAudioDeviceChange(e.target.value || null)}
+                    className="bg-[#111113] border border-zinc-800/60 rounded-lg px-2.5 py-1.5 text-xs text-zinc-200 max-w-[180px] truncate focus:outline-none focus:border-emerald-500/40 transition-colors cursor-pointer"
+                  >
+                    <option value="">System Default</option>
+                    {audioDevices.map((n) => <option key={n} value={n}>{n}</option>)}
+                  </select>
                 </div>
-              </div>
-
-              {/* STT Model */}
-              <div className={`flex gap-3 ${isMobile ? "flex-col" : "items-center justify-between"}`}>
-                <span className={LABEL_CLS_M}>STT Model</span>
-                <select
-                  value={localSttModel}
-                  onChange={(e) => setLocalSttModel(e.target.value)}
-                  className={`bg-[#111113] border border-zinc-800/60 rounded-lg px-2.5 py-1.5 text-xs text-zinc-200 truncate focus:outline-none focus:border-emerald-500/40 transition-colors cursor-pointer ${isMobile ? "w-full" : "max-w-[200px]"}`}
-                >
-                  <option value="whisper-large-v3-turbo">Large V3 Turbo ($0.04/h)</option>
-                  <option value="whisper-large-v3">Large V3 ($0.111/h)</option>
-                  <option value="distil-whisper-large-v3-en">Distil V3 EN ($0.02/h)</option>
-                </select>
-              </div>
+              )}
             </div>
           )}
         </div>
@@ -883,8 +995,8 @@ export function SettingsPanel({
           </div>
         )}
 
-        {/* --- Cleanup Instructions --- */}
-        <div className="flex flex-col gap-1">
+        {/* --- Cleanup Instructions -- hidden when offline STT mode is active --- */}
+        {localSttProvider !== "local" && <div className="flex flex-col gap-1">
           <button onClick={() => toggleSection("customPrompt")} className={sectionBtnCls}>
             <svg className={`w-4 h-4 text-zinc-500 flex-shrink-0 transition-transform duration-150 ${openSections.customPrompt ? "rotate-90" : ""}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
               <path d="M9 18l6-6-6-6" />
@@ -943,7 +1055,7 @@ export function SettingsPanel({
               <p className={isMobile ? "text-xs text-zinc-500" : "text-[11px] text-zinc-500"}>Appended to the system prompt during LLM cleanup.</p>
             </div>
           )}
-        </div>
+        </div>}
 
         {/* --- General -- desktop only features --- */}
         {isDesktop && (
@@ -1015,32 +1127,6 @@ export function SettingsPanel({
           </div>
         )}
 
-        {/* --- Webhook -- desktop only --- */}
-        {isDesktop && (
-          <div className="flex flex-col gap-1">
-            <button onClick={() => toggleSection("webhook")} className={sectionBtnCls}>
-              <svg className={`w-4 h-4 text-zinc-500 flex-shrink-0 transition-transform duration-150 ${openSections.webhook ? "rotate-90" : ""}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M9 18l6-6-6-6" />
-              </svg>
-              <span className="text-sm font-semibold text-zinc-300 uppercase tracking-wide">Webhook</span>
-            </button>
-            {openSections.webhook && (
-              <div className="flex flex-col gap-3 pl-4 pb-3 pt-1">
-                <div className={!isPaid ? "opacity-50" : ""}>
-                  <input
-                    type="url"
-                    placeholder={isPaid ? "https://example.com/webhook" : "Requires Dikta License"}
-                    value={localWebhookUrl}
-                    disabled={!isPaid}
-                    onChange={(e) => setLocalWebhookUrl(e.target.value)}
-                    className={`${INPUT_CLS_M}${!isPaid ? " cursor-not-allowed" : ""}`}
-                  />
-                </div>
-                <p className={isMobile ? "text-xs text-zinc-500" : "text-[11px] text-zinc-500"}>HTTP POST after each dictation. Leave empty to disable.</p>
-              </div>
-            )}
-          </div>
-        )}
 
         {/* --- Sync --- */}
         <div className="flex flex-col gap-1">
@@ -1048,7 +1134,10 @@ export function SettingsPanel({
             <svg className={`w-4 h-4 text-zinc-500 flex-shrink-0 transition-transform duration-150 ${openSections.sync ? "rotate-90" : ""}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
               <path d="M9 18l6-6-6-6" />
             </svg>
-            <span className="text-sm font-semibold text-zinc-300 uppercase tracking-wide">Cross-Device Sync</span>
+            <span className="flex items-center gap-1.5 text-sm font-semibold text-zinc-300 uppercase tracking-wide">
+              Cross-Device Sync
+              {!isPaid && <LockIcon className="w-3 h-3 text-zinc-600" />}
+            </span>
           </button>
           {openSections.sync && (
             <div className={`flex flex-col gap-3 pl-4 pb-3 pt-1${!isPaid ? " opacity-50" : ""}`}>
@@ -1118,6 +1207,7 @@ export function SettingsPanel({
               <div className="flex flex-col gap-1.5">
                 <div className="flex items-center gap-2">
                   <span className={LABEL_CLS_M}>Groq</span>
+                  <span className={isMobile ? "text-xs text-zinc-500" : "text-[11px] text-zinc-500"}>(Speech + Cleanup)</span>
                   <StatusDot active={groqOk} />
                 </div>
                 <input
@@ -1134,6 +1224,7 @@ export function SettingsPanel({
               <div className="flex flex-col gap-1.5">
                 <div className="flex items-center gap-2">
                   <span className={LABEL_CLS_M}>DeepSeek</span>
+                  <span className={isMobile ? "text-xs text-zinc-500" : "text-[11px] text-zinc-500"}>(Cleanup)</span>
                   <StatusDot active={deepseekOk} />
                 </div>
                 <input
@@ -1150,6 +1241,7 @@ export function SettingsPanel({
               <div className="flex flex-col gap-1.5">
                 <div className="flex items-center gap-2">
                   <span className={LABEL_CLS_M}>OpenAI</span>
+                  <span className={isMobile ? "text-xs text-zinc-500" : "text-[11px] text-zinc-500"}>(Speech + Cleanup)</span>
                   <StatusDot active={openaiOk} />
                 </div>
                 <input
@@ -1166,8 +1258,8 @@ export function SettingsPanel({
               <div className="flex flex-col gap-1.5">
                 <div className="flex items-center gap-2">
                   <span className={LABEL_CLS_M}>Anthropic</span>
+                  <span className={isMobile ? "text-xs text-zinc-500" : "text-[11px] text-zinc-500"}>(Cleanup)</span>
                   <StatusDot active={anthropicOk} />
-                  <span className={isMobile ? "text-xs text-zinc-500" : "text-[11px] text-zinc-500"}>(LLM only)</span>
                 </div>
                 <input
                   type="password"
@@ -1183,50 +1275,18 @@ export function SettingsPanel({
           )}
         </div>
 
-        {/* --- Provider Priority --- */}
-        <div className="flex flex-col gap-1">
-          <button onClick={() => toggleSection("providerPriority")} className={sectionBtnCls}>
-            <svg className={`w-4 h-4 text-zinc-500 flex-shrink-0 transition-transform duration-150 ${openSections.providerPriority ? "rotate-90" : ""}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M9 18l6-6-6-6" />
-            </svg>
-            <span className="text-sm font-semibold text-zinc-300 uppercase tracking-wide">Provider Priority</span>
-          </button>
-          {openSections.providerPriority && (
-            <div className="flex flex-col gap-3 pl-4 pb-3 pt-1">
-              <p className={isMobile ? "text-xs text-zinc-500" : "text-[11px] text-zinc-500"}>
-                {isMobile ? "Use arrows to reorder." : "Drag to reorder."} First provider with a configured key is used. If it fails, the next one is tried.
-              </p>
-
-              <div className="flex flex-col gap-2">
-                <span className={LABEL_CLS_M}>Speech-to-Text</span>
-                <ProviderPriorityList
-                  items={localSttPriority}
-                  onChange={setLocalSttPriority}
-                  keyStatus={{ groq: groqOk, openai: openaiOk }}
-                  labels={{ groq: "Groq Whisper", openai: "OpenAI Whisper" }}
-                />
-              </div>
-
-              <div className="flex flex-col gap-2">
-                <span className={LABEL_CLS_M}>Text Cleanup (LLM)</span>
-                <ProviderPriorityList
-                  items={localLlmPriority}
-                  onChange={setLocalLlmPriority}
-                  keyStatus={{ deepseek: deepseekOk, openai: openaiOk, anthropic: anthropicOk, groq: groqOk }}
-                  labels={{ deepseek: "DeepSeek", openai: "OpenAI", anthropic: "Anthropic", groq: "Groq (Llama)" }}
-                />
-              </div>
-            </div>
-          )}
-        </div>
-
         {/* --- Dictionary --- */}
         <div className="flex flex-col gap-1">
           <button onClick={() => toggleSection("dictionary")} className={sectionBtnCls}>
             <svg className={`w-4 h-4 text-zinc-500 flex-shrink-0 transition-transform duration-150 ${openSections.dictionary ? "rotate-90" : ""}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
               <path d="M9 18l6-6-6-6" />
             </svg>
-            <span className="text-sm font-semibold text-zinc-300 uppercase tracking-wide">Dictionary</span>
+            <span className="flex items-center gap-1.5 text-sm font-semibold text-zinc-300 uppercase tracking-wide">
+              Dictionary
+              <span className={`text-[10px] font-normal normal-case tracking-normal ${!isPaid && dictionary.length >= 20 ? "text-amber-500/80" : "text-zinc-600"}`}>
+                {!isPaid ? `${dictionary.length}/20` : `${dictionary.length}`}
+              </span>
+            </span>
           </button>
           {openSections.dictionary && (
             <div className="flex flex-col gap-3 pl-4 pb-3 pt-1">
@@ -1235,18 +1295,26 @@ export function SettingsPanel({
                   type="text"
                   placeholder="Add word or phrase..."
                   value={newTerm}
+                  disabled={!isPaid && dictionary.length >= 20}
                   onChange={(e) => setNewTerm(e.target.value)}
                   onKeyDown={(e) => e.key === "Enter" && handleAddTerm()}
-                  className={`flex-1 ${INPUT_CLS_M}`}
+                  className={`flex-1 ${INPUT_CLS_M}${(!isPaid && dictionary.length >= 20) ? " cursor-not-allowed opacity-50" : ""}`}
                 />
                 <button
                   onClick={handleAddTerm}
-                  disabled={!newTerm.trim()}
+                  disabled={!newTerm.trim() || (!isPaid && dictionary.length >= 20)}
+                  title={(!isPaid && dictionary.length >= 20) ? "Free limit reached (20 terms). Upgrade for unlimited." : undefined}
                   className={`px-3 rounded-lg font-medium bg-[#111113] border border-zinc-800/60 text-zinc-300 hover:bg-zinc-800/60 disabled:opacity-30 disabled:cursor-not-allowed transition-colors ${isMobile ? "py-2.5 text-sm min-w-[56px]" : "py-2 text-xs"}`}
                 >
                   Add
                 </button>
               </div>
+
+              {!isPaid && dictionary.length >= 20 && (
+                <p className="text-[11px] text-amber-500/80">
+                  Free limit reached (20 terms). Upgrade for unlimited.
+                </p>
+              )}
 
               {dictionary.length > 0 ? (
                 <div className="flex flex-wrap gap-1.5">
@@ -1276,110 +1344,126 @@ export function SettingsPanel({
           </div>
         )}
 
-        {/* --- App Profiles --- */}
+        {/* --- App Profiles (paid feature) --- */}
         <div className="flex flex-col gap-1">
           <button onClick={() => toggleSection("appProfiles")} className={sectionBtnCls}>
             <svg className={`w-4 h-4 text-zinc-500 flex-shrink-0 transition-transform duration-150 ${openSections.appProfiles ? "rotate-90" : ""}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
               <path d="M9 18l6-6-6-6" />
             </svg>
-            <span className="text-sm font-semibold text-zinc-300 uppercase tracking-wide">App Profiles</span>
+            <span className="flex items-center gap-1.5 text-sm font-semibold text-zinc-300 uppercase tracking-wide">
+              App Profiles
+              {!isPaid && <LockIcon className="w-3 h-3 text-zinc-600" />}
+            </span>
           </button>
           {openSections.appProfiles && (
             <div className="flex flex-col gap-3 pl-4 pb-3 pt-1">
-              <p className="text-[11px] text-zinc-500">Override style/language per app. Matches window title substring.</p>
-
-              {profiles.map((p, i) => (
-                <div key={i} className="bg-[#111113] border border-zinc-800/60 rounded-xl p-3 flex flex-col gap-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <input
-                      type="text"
-                      placeholder="Profile name"
-                      value={p.name}
-                      onChange={(e) => {
-                        const next = [...profiles];
-                        next[i] = { ...next[i], name: e.target.value };
-                        setProfiles(next);
-                      }}
-                      className={`flex-1 ${INPUT_CLS}`}
-                    />
-                    <button
-                      onClick={() => {
-                        const next = profiles.filter((_, j) => j !== i);
-                        setProfiles(next);
-                        saveProfiles(next).catch(console.error);
-                      }}
-                      className="text-zinc-500 hover:text-red-400 transition-colors p-1"
-                    >
-                      <CloseIcon />
-                    </button>
+              {!isPaid ? (
+                // Free-tier paygate: show lock message, no profile editing allowed.
+                <div className="flex flex-col gap-2">
+                  <div className="flex items-center gap-2 text-zinc-500">
+                    <LockIcon className="w-3.5 h-3.5 text-zinc-600 flex-shrink-0" />
+                    <p className="text-xs">App Profiles require a Dikta license.</p>
                   </div>
-                  <input
-                    type="text"
-                    placeholder="Window title pattern, e.g. 'Slack' or 'Visual Studio'"
-                    value={p.appPattern}
-                    onChange={(e) => {
-                      const next = [...profiles];
-                      next[i] = { ...next[i], appPattern: e.target.value };
-                      setProfiles(next);
-                    }}
-                    className={INPUT_CLS}
-                  />
-                  <div className="flex gap-2">
-                    <select
-                      value={p.cleanupStyle}
-                      onChange={(e) => {
-                        const next = [...profiles];
-                        next[i] = { ...next[i], cleanupStyle: e.target.value as CleanupStyle };
-                        setProfiles(next);
-                      }}
-                      className="bg-[#111113] border border-zinc-800/60 rounded-lg px-2 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-emerald-500/40 cursor-pointer"
-                    >
-                      {STYLE_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
-                    </select>
-                    <select
-                      value={p.language}
-                      onChange={(e) => {
-                        const next = [...profiles];
-                        next[i] = { ...next[i], language: e.target.value };
-                        setProfiles(next);
-                      }}
-                      className="bg-[#111113] border border-zinc-800/60 rounded-lg px-2 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-emerald-500/40 cursor-pointer"
-                    >
-                      <option value="">Auto</option>
-                      <option value="de">DE</option>
-                      <option value="en">EN</option>
-                    </select>
-                  </div>
-                  <input
-                    type="text"
-                    placeholder="Custom prompt for this app (optional)"
-                    value={p.customPrompt}
-                    onChange={(e) => {
-                      const next = [...profiles];
-                      next[i] = { ...next[i], customPrompt: e.target.value };
-                      setProfiles(next);
-                    }}
-                    className={INPUT_CLS}
-                  />
+                  <p className="text-[11px] text-zinc-600">Override style and language per app based on window title.</p>
                 </div>
-              ))}
+              ) : (
+                <>
+                  <p className="text-[11px] text-zinc-500">Override style/language per app. Matches window title substring.</p>
 
-              <div className="flex gap-2">
-                <button
-                  onClick={() => setProfiles([...profiles, { name: "", appPattern: "", cleanupStyle: "polished", language: "", customPrompt: "" }])}
-                  className="px-3 py-2 rounded-lg text-xs font-medium bg-[#111113] border border-zinc-800/60 text-zinc-300 hover:bg-zinc-800/60 transition-colors"
-                >
-                  + Add Profile
-                </button>
-                {profiles.length > 0 && (
-                  <button
-                    onClick={() => saveProfiles(profiles).then(() => setSaveMsg("Profiles saved")).catch((e) => setSaveMsg(String(e)))}
-                    className="px-3 py-2 rounded-lg text-xs font-medium bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/15 transition-colors"
-                  >
-                    Save Profiles
-                  </button>
-                )}
-              </div>
+                  {profiles.map((p, i) => (
+                    <div key={i} className="bg-[#111113] border border-zinc-800/60 rounded-xl p-3 flex flex-col gap-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <input
+                          type="text"
+                          placeholder="Profile name"
+                          value={p.name}
+                          onChange={(e) => {
+                            const next = [...profiles];
+                            next[i] = { ...next[i], name: e.target.value };
+                            setProfiles(next);
+                          }}
+                          className={`flex-1 ${INPUT_CLS}`}
+                        />
+                        <button
+                          onClick={() => {
+                            const next = profiles.filter((_, j) => j !== i);
+                            setProfiles(next);
+                            saveProfiles(next).catch(console.error);
+                          }}
+                          className="text-zinc-500 hover:text-red-400 transition-colors p-1"
+                        >
+                          <CloseIcon />
+                        </button>
+                      </div>
+                      <input
+                        type="text"
+                        placeholder="Window title pattern, e.g. 'Slack' or 'Visual Studio'"
+                        value={p.appPattern}
+                        onChange={(e) => {
+                          const next = [...profiles];
+                          next[i] = { ...next[i], appPattern: e.target.value };
+                          setProfiles(next);
+                        }}
+                        className={INPUT_CLS}
+                      />
+                      <div className="flex gap-2">
+                        <select
+                          value={p.cleanupStyle}
+                          onChange={(e) => {
+                            const next = [...profiles];
+                            next[i] = { ...next[i], cleanupStyle: e.target.value as CleanupStyle };
+                            setProfiles(next);
+                          }}
+                          className="bg-[#111113] border border-zinc-800/60 rounded-lg px-2 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-emerald-500/40 cursor-pointer"
+                        >
+                          {STYLE_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+                        </select>
+                        <select
+                          value={p.language}
+                          onChange={(e) => {
+                            const next = [...profiles];
+                            next[i] = { ...next[i], language: e.target.value };
+                            setProfiles(next);
+                          }}
+                          className="bg-[#111113] border border-zinc-800/60 rounded-lg px-2 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-emerald-500/40 cursor-pointer"
+                        >
+                          <option value="">Auto</option>
+                          <option value="de">DE</option>
+                          <option value="en">EN</option>
+                        </select>
+                      </div>
+                      <input
+                        type="text"
+                        placeholder="Custom prompt for this app (optional)"
+                        value={p.customPrompt}
+                        onChange={(e) => {
+                          const next = [...profiles];
+                          next[i] = { ...next[i], customPrompt: e.target.value };
+                          setProfiles(next);
+                        }}
+                        className={INPUT_CLS}
+                      />
+                    </div>
+                  ))}
+
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setProfiles([...profiles, { name: "", appPattern: "", cleanupStyle: "polished", language: "", customPrompt: "" }])}
+                      className="px-3 py-2 rounded-lg text-xs font-medium bg-[#111113] border border-zinc-800/60 text-zinc-300 hover:bg-zinc-800/60 transition-colors"
+                    >
+                      + Add Profile
+                    </button>
+                    {profiles.length > 0 && (
+                      <button
+                        onClick={() => saveProfiles(profiles).then(() => setSaveMsg("Profiles saved")).catch((e) => setSaveMsg(String(e)))}
+                        className="px-3 py-2 rounded-lg text-xs font-medium bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/15 transition-colors"
+                      >
+                        Save Profiles
+                      </button>
+                    )}
+                  </div>
+                </>
+              )}
             </div>
           )}
         </div>
@@ -1395,7 +1479,16 @@ export function SettingsPanel({
           {openSections.license && (
             <LicenseSection
               licenseStatus={licenseStatus}
-              onValidate={onValidateLicense}
+              onValidate={async (key) => {
+                const err = await onValidateLicense(key);
+                if (!err) {
+                  // Persist immediately so the license is not lost on app restart.
+                  // This must not affect isDirty -- handleLicenseAutoSave uses
+                  // empty key strings (backend keeps existing keys unchanged).
+                  await handleLicenseAutoSave();
+                }
+                return err;
+              }}
               onRemove={onRemoveLicense}
               licenseLoading={licenseLoading}
             />
@@ -1433,28 +1526,30 @@ export function SettingsPanel({
 
       </div>
 
-      {/* Save button -- sticky footer, always visible.
+      {/* Save button -- sticky footer, visible only when there are unsaved changes.
           On Android the nav bar (Back/Home/Recent) overlaps the WebView bottom.
           mobile-safe-bottom adds a fixed 56 px padding (env() is unreliable in
           Android WebView and returns 0). The parent panel max-h also accounts for
           the ~48 px nav bar so this footer is never clipped by the container. */}
-      <div className={`px-4 py-3 border-t border-zinc-800/40 ${isMobile ? "mobile-safe-bottom" : ""}`}>
-        <button
-          onClick={handleSave}
-          disabled={saving}
-          className={[
-            "w-full py-2.5 rounded-xl text-sm font-medium transition-all duration-150 border",
-            saveMsg === "Saved"
-              ? "bg-emerald-500/15 border-emerald-500/30 text-emerald-400"
-              : saveMsg && saveMsg !== "Saved"
-              ? "bg-red-500/10 border-red-500/20 text-red-400"
-              : "bg-emerald-500/10 border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/15 hover:border-emerald-500/30",
-            "disabled:opacity-50 disabled:cursor-not-allowed",
-          ].join(" ")}
-        >
-          {saving ? "Saving..." : saveMsg ?? "Save Settings"}
-        </button>
-      </div>
+      {(isDirty || saveMsg) && (
+        <div className={`px-4 py-3 border-t border-zinc-800/40 ${isMobile ? "mobile-safe-bottom" : ""}`}>
+          <button
+            onClick={handleSave}
+            disabled={saving}
+            className={[
+              "w-full py-2.5 rounded-xl text-sm font-medium transition-all duration-150 border",
+              saveMsg === "Saved"
+                ? "bg-emerald-500/15 border-emerald-500/30 text-emerald-400"
+                : saveMsg && saveMsg !== "Saved"
+                ? "bg-red-500/10 border-red-500/20 text-red-400"
+                : "bg-emerald-500/10 border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/15 hover:border-emerald-500/40 animate-pulse",
+              "disabled:opacity-50 disabled:cursor-not-allowed",
+            ].join(" ")}
+          >
+            {saving ? "Saving..." : saveMsg ?? "Save Settings"}
+          </button>
+        </div>
+      )}
     </div>
   );
 }

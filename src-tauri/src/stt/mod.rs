@@ -25,6 +25,13 @@ use reqwest::multipart;
 use serde::Deserialize;
 use thiserror::Error;
 
+// Sub-modules
+pub mod local_whisper;
+#[cfg(target_os = "windows")]
+pub use local_whisper::LocalWhisperProvider;
+
+pub mod model_manager;
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -43,6 +50,11 @@ pub enum SttError {
 
     #[error("Audio data is empty")]
     EmptyAudio,
+
+    /// Error from the local whisper.cpp backend (offline STT).
+    /// The inner string contains the formatted `LocalWhisperError` message.
+    #[error("Local whisper error: {0}")]
+    LocalWhisper(String),
 }
 
 // ---------------------------------------------------------------------------

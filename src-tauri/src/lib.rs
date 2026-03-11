@@ -133,10 +133,10 @@ pub struct SettingsView {
     pub openai_api_key_masked: String,
     /// Masked Anthropic API key.
     pub anthropic_api_key_masked: String,
-    /// Ordered list of STT provider IDs (first with a key wins).
-    pub stt_priority: Vec<String>,
-    /// Ordered list of LLM provider IDs (first with a key wins).
-    pub llm_priority: Vec<String>,
+    /// Selected STT provider: "groq", "openai", or "local".
+    pub stt_provider: String,
+    /// Selected LLM cleanup provider: "deepseek", "openai", "anthropic", or "groq".
+    pub llm_provider: String,
     /// Output language for translation (empty = no translation).
     pub output_language: String,
     /// Webhook URL for HTTP POST after each dictation. Empty = disabled.
@@ -151,6 +151,10 @@ pub struct SettingsView {
     pub bubble_size: f32,
     /// Android bubble opacity (0.3..1.0). Default: 0.85.
     pub bubble_opacity: f32,
+    /// GGML model variant for offline STT (e.g. `"base"`, `"tiny-q5_1"`).
+    pub local_whisper_model: String,
+    /// Whether GPU acceleration (CUDA) is enabled for local whisper.
+    pub local_whisper_gpu: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -691,6 +695,13 @@ pub fn run() {
             commands::license::validate_license,
             commands::license::get_license_status,
             commands::license::remove_license,
+            // Whisper model manager (Windows only)
+            #[cfg(target_os = "windows")]
+            commands::whisper::windows::get_whisper_models,
+            #[cfg(target_os = "windows")]
+            commands::whisper::windows::download_whisper_model,
+            #[cfg(target_os = "windows")]
+            commands::whisper::windows::delete_whisper_model,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -777,8 +788,8 @@ mod tests {
             whisper_mode: false,
             openai_api_key_masked: String::new(),
             anthropic_api_key_masked: String::new(),
-            stt_priority: vec!["groq".to_string(), "openai".to_string()],
-            llm_priority: vec!["deepseek".to_string(), "openai".to_string()],
+            stt_provider: "groq".to_string(),
+            llm_provider: "deepseek".to_string(),
             output_language: String::new(),
             webhook_url: String::new(),
             turso_url: String::new(),
@@ -786,6 +797,8 @@ mod tests {
             device_id: "test-device".to_string(),
             bubble_size: 1.0,
             bubble_opacity: 0.85,
+            local_whisper_model: "base".to_string(),
+            local_whisper_gpu: true,
         };
         let json = serde_json::to_string(&view).unwrap();
         assert!(json.contains("groqApiKeyMasked"), "expected camelCase key");
@@ -816,8 +829,8 @@ mod tests {
             whisper_mode: false,
             openai_api_key_masked: String::new(),
             anthropic_api_key_masked: String::new(),
-            stt_priority: vec!["groq".to_string(), "openai".to_string()],
-            llm_priority: vec!["deepseek".to_string(), "openai".to_string()],
+            stt_provider: "groq".to_string(),
+            llm_provider: "deepseek".to_string(),
             output_language: String::new(),
             webhook_url: String::new(),
             turso_url: String::new(),
@@ -825,6 +838,8 @@ mod tests {
             device_id: "test-device".to_string(),
             bubble_size: 1.0,
             bubble_opacity: 0.85,
+            local_whisper_model: "base".to_string(),
+            local_whisper_gpu: true,
         };
         let json = serde_json::to_string(&view).unwrap();
         assert!(
@@ -849,8 +864,8 @@ mod tests {
             whisper_mode: false,
             openai_api_key_masked: String::new(),
             anthropic_api_key_masked: String::new(),
-            stt_priority: vec!["groq".to_string(), "openai".to_string()],
-            llm_priority: vec!["deepseek".to_string(), "openai".to_string()],
+            stt_provider: "groq".to_string(),
+            llm_provider: "deepseek".to_string(),
             output_language: String::new(),
             webhook_url: String::new(),
             turso_url: String::new(),
@@ -858,6 +873,8 @@ mod tests {
             device_id: "test-device".to_string(),
             bubble_size: 1.0,
             bubble_opacity: 0.85,
+            local_whisper_model: "base".to_string(),
+            local_whisper_gpu: true,
         };
         let json = serde_json::to_string(&view).unwrap();
         assert!(
