@@ -23,6 +23,7 @@ Sprache in jedem Textfeld systemweit in bereinigten Text umwandeln. Kein Abo, ke
 - **Voice Notes:** Aufnahmen speichern statt einfügen
 - **Command Mode:** Text selektieren, Sprachbefehl geben (Strg+Shift+E)
 - **Whisper Mode:** Verstärkung für leises Diktieren
+- **Offline Spracherkennung:** Lokale whisper.cpp-Engine, kein Internet nötig (Windows)
 - **Multi-Provider:** STT und LLM-Provider frei konfigurierbar (Groq, OpenAI, DeepSeek, Anthropic)
 
 ### Windows
@@ -55,7 +56,7 @@ API-Keys werden beim ersten Start über den Einrichtungs-Wizard eingegeben, oder
 | Frontend | React + TypeScript + Tailwind CSS |
 | Backend | Rust (Audio, STT, LLM, Paste, Hotkey) |
 | Mobile | Tauri v2 Android + Kotlin (Floating Bubble, native Audio) |
-| STT | Groq Whisper API (primär), OpenAI Whisper (Fallback) |
+| STT | Groq Whisper API (primär), OpenAI Whisper (Fallback), whisper.cpp (offline) |
 | Text-Cleanup | DeepSeek (primär), OpenAI, Anthropic, Groq/Llama (konfigurierbar) |
 | Speicherung | JSON (Config, Dictionary), SQLite (History, Stats) |
 
