@@ -23,8 +23,9 @@ Sprache in jedem Textfeld systemweit in bereinigten Text umwandeln. Kein Abo, ke
 - **Voice Notes:** Aufnahmen speichern statt einfügen
 - **Command Mode:** Text selektieren, Sprachbefehl geben (Strg+Shift+E)
 - **Whisper Mode:** Verstärkung für leises Diktieren
-- **Offline Spracherkennung:** Lokale whisper.cpp-Engine, kein Internet nötig (Windows)
-- **Multi-Provider:** STT und LLM-Provider frei konfigurierbar (Groq, OpenAI, DeepSeek, Anthropic)
+- **Offline Spracherkennung:** Lokale whisper.cpp-Engine, kein Internet nötig (Windows). Cloud/Offline per Toggle umschaltbar.
+- **Multi-Provider:** STT- und LLM-Provider direkt auswählbar (Groq, OpenAI, DeepSeek, Anthropic)
+- **Free/Paid-Modell:** Kernfunktionen kostenlos, erweiterte Features per Lizenzschlüssel (mit Trial-Option)
 
 ### Windows
 - Globaler Hotkey (Hold oder Toggle, konfigurierbar)
@@ -39,14 +40,17 @@ Sprache in jedem Textfeld systemweit in bereinigten Text umwandeln. Kein Abo, ke
 
 ## Voraussetzungen
 
-Dikta nutzt Cloud-APIs für Transkription und Text-Bereinigung. Du brauchst mindestens:
+Dikta kann komplett offline oder mit Cloud-APIs betrieben werden.
 
+**Cloud-Modus** (empfohlen für beste Qualität):
 1. **Groq API Key** (kostenlos) — für Sprache-zu-Text (Whisper)
 2. **DeepSeek API Key** (sehr günstig) — für Text-Bereinigung
 
+**Offline-Modus** (Windows): Lokales whisper.cpp-Modell herunterladen, kein API-Key nötig.
+
 API-Keys werden beim ersten Start über den Einrichtungs-Wizard eingegeben, oder später in den Settings.
 
-> **Kosten:** Bei normalem Gebrauch (30-60 Diktate/Tag) unter 0,10 € pro Tag. Groq hat ein großzügiges Free Tier, DeepSeek kostet ~0,001 € pro Diktat.
+> **Kosten Cloud:** Bei normalem Gebrauch (30-60 Diktate/Tag) unter 0,10 € pro Tag. Groq hat ein großzügiges Free Tier, DeepSeek kostet ~0,001 € pro Diktat.
 
 ## Tech-Stack
 
