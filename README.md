@@ -23,9 +23,7 @@ Sprache in jedem Textfeld systemweit in bereinigten Text umwandeln. Kein Abo, ke
 - **Voice Notes:** Aufnahmen speichern statt einfügen
 - **Command Mode:** Text selektieren, Sprachbefehl geben (Strg+Shift+E)
 - **Whisper Mode:** Verstärkung für leises Diktieren
-- **Offline Spracherkennung:** Lokale whisper.cpp-Engine, kein Internet nötig (Windows). Cloud/Offline per Toggle umschaltbar.
-- **Multi-Provider:** STT- und LLM-Provider direkt auswählbar (Groq, OpenAI, DeepSeek, Anthropic)
-- **Free/Paid-Modell:** Kernfunktionen kostenlos, erweiterte Features per Lizenzschlüssel (mit Trial-Option)
+- **Multi-Provider:** STT und LLM-Provider frei konfigurierbar (Groq, OpenAI, DeepSeek, Anthropic)
 
 ### Windows
 - Globaler Hotkey (Hold oder Toggle, konfigurierbar)
@@ -40,17 +38,14 @@ Sprache in jedem Textfeld systemweit in bereinigten Text umwandeln. Kein Abo, ke
 
 ## Voraussetzungen
 
-Dikta kann komplett offline oder mit Cloud-APIs betrieben werden.
+Dikta nutzt Cloud-APIs für Transkription und Text-Bereinigung. Du brauchst mindestens:
 
-**Cloud-Modus** (empfohlen für beste Qualität):
 1. **Groq API Key** (kostenlos) — für Sprache-zu-Text (Whisper)
 2. **DeepSeek API Key** (sehr günstig) — für Text-Bereinigung
 
-**Offline-Modus** (Windows): Lokales whisper.cpp-Modell herunterladen, kein API-Key nötig.
-
 API-Keys werden beim ersten Start über den Einrichtungs-Wizard eingegeben, oder später in den Settings.
 
-> **Kosten Cloud:** Bei normalem Gebrauch (30-60 Diktate/Tag) unter 0,10 € pro Tag. Groq hat ein großzügiges Free Tier, DeepSeek kostet ~0,001 € pro Diktat.
+> **Kosten:** Bei normalem Gebrauch (30-60 Diktate/Tag) unter 0,10 € pro Tag. Groq hat ein großzügiges Free Tier, DeepSeek kostet ~0,001 € pro Diktat.
 
 ## Tech-Stack
 
@@ -60,7 +55,7 @@ API-Keys werden beim ersten Start über den Einrichtungs-Wizard eingegeben, oder
 | Frontend | React + TypeScript + Tailwind CSS |
 | Backend | Rust (Audio, STT, LLM, Paste, Hotkey) |
 | Mobile | Tauri v2 Android + Kotlin (Floating Bubble, native Audio) |
-| STT | Groq Whisper API (primär), OpenAI Whisper (Fallback), whisper.cpp (offline) |
+| STT | Groq Whisper API (primär), OpenAI Whisper (Fallback) |
 | Text-Cleanup | DeepSeek (primär), OpenAI, Anthropic, Groq/Llama (konfigurierbar) |
 | Speicherung | JSON (Config, Dictionary), SQLite (History, Stats) |
 
