@@ -2,16 +2,19 @@
 export type CleanupStyle = "polished" | "verbatim" | "chat";
 
 // Hotkey activation mode.
-// hold   = push-to-talk: record while key is held, release to process.
-// toggle = press to start, press again to stop and process.
-export type HotkeyMode = "toggle" | "hold";
+// hold     = push-to-talk: record while key is held, release to process.
+// toggle   = press to start, press again to stop and process.
+// autostop = like toggle, but stops automatically after configurable silence.
+// auto     = continuous dictation: each silence gap triggers a transcription cycle.
+export type HotkeyMode = "toggle" | "hold" | "autostop" | "auto";
 
 // Payload emitted by the backend on every state transition of the hotkey pipeline.
 export interface StateChangedPayload {
   state: "recording" | "transcribing" | "cleaning" | "done" | "idle" | "error";
-  text?: string;    // present when state === "done": cleaned result text
-  rawText?: string; // present when state === "done": raw transcript before cleanup
-  error?: string;   // present when state === "error": human-readable message
+  text?: string;           // present when state === "done": cleaned result text
+  rawText?: string;        // present when state === "done": raw transcript before cleanup
+  error?: string;          // present when state === "error": human-readable message
+  clipboardOnly?: boolean; // present when state === "done": true when focus-restore failed and only clipboard was written
 }
 
 // Recording state machine states.
@@ -51,6 +54,23 @@ export interface AppSettings {
   bubbleOpacity: number;
   localWhisperModel: string;
   localWhisperGpu: boolean;
+  // Recording behaviour extensions.
+  // insertAndSend is now per-slot. These fields map to insert_and_send_slot1 / slot2 in Rust.
+  insertAndSendSlot1: boolean;
+  insertAndSendSlot2: boolean;
+  autostopSilenceSecs: number;
+  autoModeSilenceSecs: number;
+  // Second hotkey slot (optional — empty string means disabled).
+  hotkeySlot2: string;
+  hotkeyModeSlot2: HotkeyMode;
+  // Bubble touch controls (Android only).
+  // Tap and long-press each have their own mode, auto-send, and silence config.
+  bubbleTapMode: string;
+  bubbleTapAutoSend: boolean;
+  bubbleTapSilenceSecs: number;
+  bubbleLongPressMode: string;
+  bubbleLongPressAutoSend: boolean;
+  bubbleLongPressSilenceSecs: number;
 }
 
 // A per-application recording profile.
@@ -176,12 +196,12 @@ export const STYLE_OPTIONS: StyleMeta[] = [
   {
     value: "polished",
     label: "Polished",
-    description: "Clean grammar, no filler words",
+    description: "Fix grammar, smooth flow",
   },
   {
     value: "verbatim",
-    label: "Clean",
-    description: "Remove fillers, keep your words",
+    label: "Verbatim",
+    description: "Your words, just clean",
   },
   {
     value: "chat",

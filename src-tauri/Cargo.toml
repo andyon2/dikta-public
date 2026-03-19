@@ -1,6 +1,6 @@
 [package]
 name = "dikta"
-version = "0.4.3"
+version = "0.4.5"
 description = "Free voice dictation with AI text cleanup"
 authors = ["Andy"]
 edition = "2021"
@@ -47,6 +47,7 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
     "Win32_System_Registry",
     "Win32_Security",
+    "Win32_System_Threading",
 ] }
 
 # whisper-rs: offline STT fallback (CPU-only by default; CUDA support is an

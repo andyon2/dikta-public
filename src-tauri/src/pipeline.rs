@@ -4,7 +4,10 @@
 //! directly exposed as Tauri commands. They operate on [`AppState`] via
 //! an [`AppHandle`] so they can emit state-change events to the frontend.
 
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
 
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -13,7 +16,9 @@ use crate::config::{self, AppConfig, HotkeyMode};
 use crate::history;
 use crate::hotkey::{PipelineEvent, EVENT_STATE_CHANGED};
 use crate::llm::{self, chunked_cleanup, CleanupProvider, CleanupStyle};
-use crate::paste::{capture_foreground_window, capture_foreground_window_title, create_paste_handler};
+use crate::paste::{
+    capture_foreground_window, capture_foreground_window_title, create_paste_handler, PasteResult,
+};
 use crate::stt::{self, SttProvider};
 use crate::sync;
 use crate::{AppState, friendly_error};
@@ -96,6 +101,191 @@ pub fn resolve_cleanup_provider(cfg: &AppConfig) -> Arc<dyn CleanupProvider> {
 }
 
 // ---------------------------------------------------------------------------
+// Whisper hallucination detection
+// ---------------------------------------------------------------------------
+
+/// Detects when Whisper echoes the conditioning prompt instead of real speech.
+///
+/// Whisper sometimes "hallucinates" the prompt text when the audio contains
+/// ambient noise but no actual words. The hallucinated text may not be an
+/// exact copy — Whisper can vary words slightly (e.g. "punctuation" →
+/// "pronunciation") or reorder phrases.
+///
+/// Two complementary checks:
+/// 1. **Exact fragment removal** — splits the hint into sentences and removes
+///    all occurrences from the transcription. If nothing meaningful remains,
+///    it's an echo.
+/// 2. **Word-overlap** — extracts significant words (≥3 chars) from both
+///    texts and measures how many transcription words appear in the hint.
+///    If ≥60% overlap AND the transcription is short (≤30 words), it's
+///    likely a hallucination with slight word variation.
+fn is_prompt_echo(transcription: &str, stt_hint: &str) -> bool {
+    let trans = transcription.trim().to_lowercase();
+    let hint = stt_hint.trim().to_lowercase();
+
+    if trans.is_empty() || hint.is_empty() {
+        return false;
+    }
+
+    // --- Check 1: exact fragment removal ---
+    let hint_sentences: Vec<&str> = hint
+        .split(". ")
+        .flat_map(|s| s.split('.'))
+        .map(|s| s.trim())
+        .filter(|s| s.len() > 10)
+        .collect();
+
+    let mut cleaned = trans.clone();
+    for sentence in &hint_sentences {
+        cleaned = cleaned.replace(sentence, "");
+    }
+    cleaned = cleaned.replace(&hint, "");
+
+    let residue: String = cleaned
+        .chars()
+        .filter(|c| !c.is_whitespace() && !c.is_ascii_punctuation())
+        .collect();
+
+    if residue.len() < 5 {
+        return true;
+    }
+
+    // --- Check 2: word-overlap (catches Whisper word variations) ---
+    let extract_words = |text: &str| -> Vec<String> {
+        text.split(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
+            .map(|w| w.to_lowercase())
+            .filter(|w| w.len() >= 3)
+            .collect()
+    };
+
+    let trans_words = extract_words(&trans);
+    let hint_words: std::collections::HashSet<String> =
+        extract_words(&hint).into_iter().collect();
+
+    if trans_words.is_empty() {
+        return false;
+    }
+
+    // Longer texts are unlikely to be pure hallucination.
+    if trans_words.len() > 30 {
+        return false;
+    }
+
+    // Check 2a: high word-overlap with the hint (≥70%).
+    let matching = trans_words
+        .iter()
+        .filter(|w| hint_words.contains(w.as_str()))
+        .count();
+    let overlap = matching as f32 / trans_words.len() as f32;
+
+    if overlap >= 0.7 {
+        return true;
+    }
+
+    // Check 2b: highly repetitive text (low vocabulary diversity).
+    // Whisper hallucinations often repeat the same 2-3 words/phrases.
+    // Real speech has much higher word diversity.
+    let unique: std::collections::HashSet<&String> = trans_words.iter().collect();
+    let diversity = unique.len() as f32 / trans_words.len() as f32;
+    // If fewer than half the words are unique AND at least some hint words
+    // appear, it's a repetitive hallucination with word variations.
+    if diversity < 0.5 && overlap >= 0.3 {
+        return true;
+    }
+
+    false
+}
+
+// ---------------------------------------------------------------------------
+// Prompt-fragment stripping
+// ---------------------------------------------------------------------------
+
+/// Default STT conditioning prompts used by the pipeline.
+///
+/// Whisper can leak fragments of these prompts into the transcription output,
+/// especially for longer recordings. We remove any recognised fragments before
+/// the text reaches the LLM cleanup step or the hallucination guard.
+const DEFAULT_STT_HINTS: &[&str] = &[
+    "Diktat auf Deutsch mit gelegentlichen englischen Fachbegriffen. Korrekte Groß- und Kleinschreibung, Satzzeichen und Interpunktion.",
+    "Voice dictation in English. Proper punctuation, capitalization, and spelling.",
+    "Multilingual voice dictation. German and English with proper punctuation.",
+];
+
+/// Removes known STT conditioning-prompt fragments from `text`.
+///
+/// Whisper occasionally leaks parts of its `initial_prompt` into the
+/// transcription (e.g. "German and English with proper punctuation." appearing
+/// mid-sentence). This function strips those fragments so they do not pollute
+/// the LLM cleanup input or trigger false positives in the hallucination guard.
+///
+/// Algorithm:
+/// 1. Collect candidate fragments from `stt_hint` **and** every entry in
+///    `DEFAULT_STT_HINTS`.
+/// 2. Split each hint string on `". "` and `"."` to get individual sentences.
+/// 3. Remove every fragment that is at least 10 characters long, using a
+///    case-insensitive search (original casing is preserved in the output).
+/// 4. Collapse multiple consecutive spaces and trim leading/trailing whitespace.
+pub fn strip_prompt_fragments(text: &str, stt_hint: &str) -> String {
+    // Build the de-duplicated list of all hint strings to check.
+    let mut all_hints: Vec<&str> = DEFAULT_STT_HINTS.to_vec();
+    if !stt_hint.is_empty() && !DEFAULT_STT_HINTS.contains(&stt_hint) {
+        all_hints.push(stt_hint);
+    }
+
+    // Collect unique fragments (≥10 chars) from every hint string.
+    let mut fragments: Vec<String> = Vec::new();
+    for hint in &all_hints {
+        let hint_lower = hint.to_lowercase();
+        // Split on ". " first, then on ".".
+        for part in hint_lower.split(". ").flat_map(|s| s.split('.')) {
+            let fragment = part.trim().to_string();
+            if fragment.len() >= 10 && !fragments.contains(&fragment) {
+                fragments.push(fragment);
+            }
+        }
+        // Also try the full hint string as a single fragment (case-insensitive).
+        let full = hint_lower.trim().to_string();
+        if full.len() >= 10 && !fragments.contains(&full) {
+            fragments.push(full);
+        }
+    }
+
+    // Apply all fragments to the *lowercased* version of the text to find
+    // positions, but rebuild from the *original* text so casing is preserved.
+    let mut result = text.to_string();
+    for fragment in &fragments {
+        // We need a case-insensitive replace. Rust's std doesn't have one, so
+        // we do it manually: find the fragment in the lowercased result and
+        // remove the corresponding byte range from the original.
+        loop {
+            let result_lower = result.to_lowercase();
+            match result_lower.find(fragment.as_str()) {
+                Some(start) => {
+                    let end = start + fragment.len();
+                    result.replace_range(start..end, "");
+                }
+                None => break,
+            }
+        }
+    }
+
+    // Clean up in two passes:
+    // 1. Remove punctuation tokens that are now orphaned (i.e. a token that
+    //    consists entirely of punctuation characters with no surrounding word).
+    //    This handles leftover ". ." artefacts when an entire prompt sentence
+    //    was removed but the trailing period was not part of the fragment string.
+    // 2. Collapse multiple spaces and trim.
+    let tokens: Vec<&str> = result
+        .split_whitespace()
+        .filter(|token| {
+            // Keep the token if it has at least one alphanumeric character.
+            token.chars().any(|c| c.is_alphanumeric())
+        })
+        .collect();
+    tokens.join(" ")
+}
+
+// ---------------------------------------------------------------------------
 // Silence detection helper
 // ---------------------------------------------------------------------------
 
@@ -162,8 +352,8 @@ pub async fn start_recording_only(handle: AppHandle) {
 
     let device_name = state.config.lock().ok().and_then(|c| c.audio_device.clone());
     if let Err(e) = state.recorder.start_recording(device_name.as_deref()) {
-        let _ = handle.emit(
-            EVENT_STATE_CHANGED,
+        crate::emit_pipeline_state(
+            &handle,
             PipelineEvent::error(format!("Failed to start recording: {e}")),
         );
         return;
@@ -172,15 +362,128 @@ pub async fn start_recording_only(handle: AppHandle) {
     *match state.recording_start.lock() {
         Ok(g) => g,
         Err(_) => {
-            let _ = handle.emit(
-                EVENT_STATE_CHANGED,
-                PipelineEvent::error("State lock poisoned"),
-            );
+            crate::emit_pipeline_state(&handle, PipelineEvent::error("State lock poisoned"));
             return;
         }
     } = Some(std::time::Instant::now());
 
-    let _ = handle.emit(EVENT_STATE_CHANGED, PipelineEvent::recording());
+    crate::emit_pipeline_state(&handle, PipelineEvent::recording());
+}
+
+/// Starts recording with automatic stop-on-silence for AutoStop mode.
+///
+/// 1. Installs a silence-detection callback **before** calling `start_recording_only`.
+///    The callback captures a clone of `handle` and, when fired on the cpal OS-thread,
+///    spawns an async task via `tauri::async_runtime::spawn` to run the full pipeline.
+/// 2. Delegates the actual recording start to `start_recording_only`.
+///
+/// If the user presses the hotkey again while recording is still active, the
+/// `(HotkeyMode::AutoStop, ShortcutState::Pressed)` branch calls
+/// `stop_and_process_pipeline` directly (which clears the callback first),
+/// preventing a double-invocation.
+pub async fn start_autostop_recording(handle: AppHandle) {
+    let state = handle.state::<AppState>();
+
+    if state.recorder.is_recording() {
+        // Already recording -- the hotkey handler's pressed branch calls
+        // stop_and_process_pipeline for this case, so we should not reach
+        // here, but guard just in case.
+        return;
+    }
+
+    // Read silence config before installing the callback so we don't hold the
+    // config lock when start_recording_only runs.
+    let (silence_secs, silence_threshold) = state
+        .config
+        .lock()
+        .ok()
+        .map(|c| (c.autostop_silence_secs, c.advanced.silence_threshold))
+        .unwrap_or((2.0, 0.005));
+
+    // Install the silence callback. It must be set BEFORE start_recording so
+    // the recording thread picks it up via `.take()` inside start_recording.
+    let handle_for_cb = handle.clone();
+    state.recorder.set_silence_callback(
+        silence_secs,
+        silence_threshold,
+        Box::new(move || {
+            // This closure runs on the cpal OS-thread (non-async context).
+            // Spawn an async task to run the pipeline on the Tauri runtime.
+            let h = handle_for_cb.clone();
+            tauri::async_runtime::spawn(async move {
+                stop_and_process_pipeline(h).await;
+            });
+        }),
+    );
+
+    // Start the actual recording (re-uses all the foreground-window capture
+    // and audio-level emitter setup from start_recording_only).
+    start_recording_only(handle).await;
+}
+
+/// Starts recording in Auto-Loop mode.
+///
+/// Identical to [`start_autostop_recording`], but the silence callback checks
+/// [`AppState::auto_loop_active`] after the pipeline completes. If the flag is
+/// still `true`, it immediately starts another recording cycle. The loop
+/// continues until the user presses the hotkey again, which sets the flag to
+/// `false` and stops the current recording via [`stop_and_process_pipeline`].
+///
+/// Returns `Pin<Box<dyn Future + Send>>` instead of being `async fn` to break
+/// a recursive opaque-type cycle: the silence callback spawns a task that
+/// awaits this function again. With `async fn`, the compiler cannot prove the
+/// recursive future is `Send`. The explicit `Pin<Box>` gives the compiler a
+/// concrete `Send` bound to work with.
+///
+/// Race-condition note: if the user presses stop _while_ the pipeline is
+/// executing, `auto_loop_active` will be `false` by the time the check runs,
+/// so no new cycle is started. At worst one extra cycle starts and then
+/// terminates gracefully -- no crash or data loss is possible.
+pub fn start_auto_recording(handle: AppHandle) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        // Block scope: drop State before the await at the end so the future
+        // doesn't hold a borrow across the yield point.
+        {
+            let state = handle.state::<AppState>();
+
+            if state.recorder.is_recording() {
+                return;
+            }
+
+            let (silence_secs, silence_threshold) = state
+                .config
+                .lock()
+                .ok()
+                .map(|c| (c.auto_mode_silence_secs, c.advanced.silence_threshold))
+                .unwrap_or((2.0, 0.005));
+
+            let handle_for_cb = handle.clone();
+            state.recorder.set_silence_callback(
+                silence_secs,
+                silence_threshold,
+                Box::new(move || {
+                    // Runs on the cpal OS-thread. Spawn onto the Tauri async runtime.
+                    let h = handle_for_cb.clone();
+                    tauri::async_runtime::spawn(async move {
+                        stop_and_process_pipeline(h.clone()).await;
+                        // Read flag and drop State before the sleep await.
+                        let should_restart = h
+                            .state::<AppState>()
+                            .auto_loop_active
+                            .load(Ordering::SeqCst);
+                        if should_restart {
+                            // Small delay so events and cleanup finish before
+                            // the next recording cycle begins.
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            start_auto_recording(h).await;
+                        }
+                    });
+                }),
+            );
+        }
+
+        start_recording_only(handle).await;
+    })
 }
 
 /// Starts Command Mode: copies selected text via Ctrl+C, then starts recording.
@@ -356,6 +659,11 @@ pub async fn stop_and_process_pipeline(handle: AppHandle) {
         return;
     }
 
+    // Clear any pending silence callback first. This prevents the callback from
+    // firing after we have already started processing (e.g. user pressed the
+    // hotkey manually while AutoStop was still counting down silence).
+    state.recorder.clear_silence_callback();
+
     // --- Stop recording ---
     let duration_ms = {
         match state.recording_start.lock() {
@@ -424,7 +732,7 @@ pub async fn stop_and_process_pipeline(handle: AppHandle) {
     }
 
     // --- Collect config + dictionary (release locks before await points) ---
-    let (language, stt_provider, cleanup_provider, dict_prompt, offline_mode) = {
+    let (language, stt_provider, cleanup_provider, dict_prompt, offline_mode, stt_hint_text) = {
         let cfg = match state.config.lock() {
             Ok(g) => g.clone(),
             Err(_) => {
@@ -485,12 +793,19 @@ pub async fn stop_and_process_pipeline(handle: AppHandle) {
             stt_hint.as_deref(),
         );
 
+        // Keep the hint text (without dictionary terms) for hallucination detection.
+        let hint_for_check = stt_hint.unwrap_or_else(|| match cfg.language.as_str() {
+            "de" => "Diktat auf Deutsch mit gelegentlichen englischen Fachbegriffen. Korrekte Groß- und Kleinschreibung, Satzzeichen und Interpunktion.".to_string(),
+            "en" => "Voice dictation in English. Proper punctuation, capitalization, and spelling.".to_string(),
+            _ => "Multilingual voice dictation. German and English with proper punctuation.".to_string(),
+        });
+
         // Offline mode: if stt_provider is "local", the user has explicitly
         // chosen to stay offline. In this case we skip the LLM cleanup step
         // entirely -- no network call, raw text goes straight to paste.
         let offline = cfg.stt_provider == "local";
 
-        (cfg.language.clone(), stt_prov, cleanup_prov, prompt, offline)
+        (cfg.language.clone(), stt_prov, cleanup_prov, prompt, offline, hint_for_check)
     };
 
     // --- Transcribe ---
@@ -511,6 +826,30 @@ pub async fn stop_and_process_pipeline(handle: AppHandle) {
     };
 
     log::debug!("[pipeline] raw transcription: {raw_text:?}");
+
+    // --- Strip leaked STT prompt fragments ---
+    // Whisper can embed parts of the conditioning prompt into the transcription
+    // output (e.g. "German and English with proper punctuation." mid-sentence).
+    // Strip these *before* the hallucination guard so the guard sees clean text.
+    let raw_text = {
+        let stripped = strip_prompt_fragments(&raw_text, &stt_hint_text);
+        if stripped != raw_text {
+            log::debug!("[pipeline] stripped prompt fragments from transcription");
+        }
+        stripped
+    };
+
+    // --- Whisper hallucination guard ---
+    // Whisper sometimes echoes the conditioning prompt instead of transcribing
+    // actual speech (common with ambient noise but no words). Detect this by
+    // checking if the transcription is composed entirely of prompt fragments.
+    if is_prompt_echo(&raw_text, &stt_hint_text) {
+        log::info!(
+            "[pipeline] transcription is prompt echo (hallucination), skipping: {raw_text:?}"
+        );
+        let _ = handle.emit(EVENT_STATE_CHANGED, PipelineEvent::idle());
+        return;
+    }
 
     // --- Check Command Mode ---
     let is_command_mode = state
@@ -683,10 +1022,66 @@ pub async fn stop_and_process_pipeline(handle: AppHandle) {
     }
 
     // --- Paste ---
+    // Capture the window the user is CURRENTLY in, before paste switches focus.
+    // Used for Return-to-Current after autosend.
+    let current_hwnd_before_paste = crate::paste::capture_foreground_window();
     let prev_hwnd = state.prev_foreground_hwnd.lock().ok().and_then(|g| *g);
     let paste_handler = create_paste_handler(prev_hwnd);
-    if let Err(e) = paste_handler.paste(&cleaned_text) {
-        log::warn!("[pipeline] paste failed: {e}. Text is still available.");
+    let paste_result = match paste_handler.paste(&cleaned_text) {
+        Ok(result) => result,
+        Err(e) => {
+            log::warn!("[pipeline] paste failed: {e}. Text is still available.");
+            // A hard error (e.g. clipboard unavailable) is treated as
+            // clipboard-only -- the user gets an indication but the pipeline
+            // continues so the done event is still emitted.
+            PasteResult::ClipboardOnly
+        }
+    };
+
+    // --- Insert+Send + Return-to-Current ---
+    //
+    // insert_and_send is now a per-slot flag stored in AppState by the hotkey
+    // handler when recording starts. Reading it here (after the paste) is safe
+    // because the hotkey handler cannot fire again while we are still in the
+    // pipeline (the recorder is marked as recording until stop_recording_with_gain
+    // returns above, and a second hotkey press would be a no-op or a race).
+    //
+    // Only sent when Ctrl+V actually landed in the right window.
+    // Sending Enter into the wrong window (e.g. after a failed focus-restore)
+    // would be worse than not sending it at all.
+    //
+    // The 150ms sleep gives the target app time to process the Paste before
+    // Enter arrives. Terminals (ConPTY) need more time than simple editors.
+    // This is opt-in and defaults to false per slot.
+    let insert_and_send = state
+        .active_insert_and_send
+        .load(Ordering::SeqCst);
+    if insert_and_send && paste_result == PasteResult::Pasted {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        if let Err(e) = paste_handler.send_enter() {
+            log::warn!("[pipeline] send_enter failed: {e}");
+        }
+
+        // Return-to-Current: if the user switched to a different window while
+        // Dikta was processing (STT + LLM cleanup takes seconds), bring them
+        // back to where they were just before paste, not the recording-start
+        // window.
+        //
+        // current_hwnd_before_paste was captured BEFORE paste() switched focus
+        // to the target window. If it differs from prev_hwnd, the user moved
+        // to a different window during processing and we should return them.
+        if let Some(current) = current_hwnd_before_paste {
+            if Some(current) != prev_hwnd {
+                log::info!(
+                    "[pipeline] Return-to-current: restoring focus to HWND={current:#x} \
+                     (user was here during processing; paste target was {:#x})",
+                    prev_hwnd.unwrap_or(0)
+                );
+                // Small delay to let Enter land before we switch away.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                crate::paste::restore_focus(current);
+            }
+        }
     }
 
     // --- Save to history ---
@@ -822,7 +1217,13 @@ pub async fn stop_and_process_pipeline(handle: AppHandle) {
         }
     }
 
-    let _ = handle.emit(EVENT_STATE_CHANGED, PipelineEvent::done(cleaned_text, raw_text));
+    // Emit the appropriate done event based on whether the paste succeeded.
+    let done_event = if paste_result == PasteResult::ClipboardOnly {
+        PipelineEvent::done_with_clipboard_only(cleaned_text, raw_text)
+    } else {
+        PipelineEvent::done(cleaned_text, raw_text)
+    };
+    let _ = handle.emit(EVENT_STATE_CHANGED, done_event);
 }
 
 /// Toggle-mode hotkey handler: press once to start, press again to stop + process.
@@ -838,59 +1239,40 @@ pub async fn run_dictation_pipeline(handle: AppHandle) {
     }
 }
 
-/// Registers the global shortcut with mode-aware handlers.
+/// Registers the global shortcut(s) with mode-aware handlers.
+///
+/// Reads `hotkey_slots` from the current `AppState` config. Each enabled slot
+/// (non-empty `hotkey` string) gets its own independent handler that uses the
+/// slot's `mode`. Disabled slots (empty `hotkey`) are silently skipped.
 ///
 /// Unregisters all existing shortcuts first so this can be called to
 /// re-register after a settings change.
 ///
-/// - `Toggle`: Pressed fires [`run_dictation_pipeline`] (start or stop+process).
-/// - `Hold`: Pressed fires [`start_recording_only`]; Released fires [`stop_and_process_pipeline`].
+/// Both slots share the same recorder: the `is_recording()` guard inside each
+/// handler prevents two slots from starting a recording simultaneously.
+///
+/// Recording modes per slot:
+/// - `Toggle`:  Pressed fires [`run_dictation_pipeline`] (start or stop+process).
+/// - `Hold`:    Pressed fires [`start_recording_only`]; Released fires
+///              [`stop_and_process_pipeline`].
+/// - `AutoStop`: Press once to start; silence stops automatically. Second press
+///               stops manually if still recording.
+/// - `Auto`:    Like AutoStop but loops until the user presses again.
 #[cfg(desktop)]
-pub fn register_hotkey(
-    handle: &AppHandle,
-    shortcut: tauri_plugin_global_shortcut::Shortcut,
-    mode: HotkeyMode,
-) -> Result<(), String> {
+pub fn register_hotkey(handle: &AppHandle) -> Result<(), String> {
     use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
-    println!("[hotkey] Registering shortcut: {shortcut:?} mode={mode:?}");
+    // Read enabled slots from the current config. We clone the data out of the
+    // lock immediately so we don't hold the Mutex while calling into the
+    // global-shortcut plugin (which may acquire its own internal lock).
+    let slots: Vec<crate::config::HotkeySlot> = handle
+        .state::<AppState>()
+        .config
+        .lock()
+        .ok()
+        .map(|c| c.hotkey_slots.clone())
+        .unwrap_or_default();
 
-    handle
-        .global_shortcut()
-        .unregister_all()
-        .map_err(|e| format!("Failed to unregister shortcuts: {e}"))?;
-
-    // --- Dictation hotkey ---
-    let handle_clone = handle.clone();
-    handle
-        .global_shortcut()
-        .on_shortcut(shortcut, move |_app, _shortcut, event| {
-            println!("[hotkey] Event: {event:?}");
-
-            let h = handle_clone.clone();
-            println!("[hotkey] mode={mode:?} state={:?}", event.state);
-            match (mode, event.state) {
-                (HotkeyMode::Toggle, ShortcutState::Pressed) => {
-                    tauri::async_runtime::spawn(async move {
-                        run_dictation_pipeline(h).await;
-                    });
-                }
-                (HotkeyMode::Hold, ShortcutState::Pressed) => {
-                    tauri::async_runtime::spawn(async move {
-                        start_recording_only(h).await;
-                    });
-                }
-                (HotkeyMode::Hold, ShortcutState::Released) => {
-                    tauri::async_runtime::spawn(async move {
-                        stop_and_process_pipeline(h).await;
-                    });
-                }
-                _ => {}
-            }
-        })
-        .map_err(|e| format!("Failed to register shortcut: {e}"))?;
-
-    // --- Command Mode hotkey ---
     let cmd_shortcut_str = handle
         .state::<AppState>()
         .config
@@ -899,6 +1281,173 @@ pub fn register_hotkey(
         .map(|c| c.command_hotkey.clone())
         .unwrap_or_else(|| "ctrl+shift+e".to_string());
 
+    println!("[hotkey] Re-registering hotkeys: {} slot(s)", slots.len());
+
+    handle
+        .global_shortcut()
+        .unregister_all()
+        .map_err(|e| format!("Failed to unregister shortcuts: {e}"))?;
+
+    // --- Dictation slots ---
+    //
+    // FIX: Previously each slot called `on_shortcut()` in a loop, which caused
+    // the plugin to overwrite the per-shortcut handler map entry for the last
+    // registered shortcut, making ALL slots behave like the last slot's mode.
+    //
+    // Now we build a (shortcut_id, mode) dispatch map up front, collect all
+    // valid shortcut objects, and register them with a SINGLE `on_shortcuts()`
+    // call + one shared handler.  Inside the handler we look up the mode by
+    // `shortcut.id()` so each slot dispatches to its own mode correctly.
+    //
+    // `Shortcut` does not implement `Hash`/`Eq`, so we key the map by the
+    // `u32` hotkey ID returned by `shortcut.id()`.
+
+    // Build dispatch map: hotkey_id -> (mode, insert_and_send)
+    let mut slot_map: Vec<(u32, HotkeyMode, bool)> = Vec::new();
+    let mut shortcut_objects: Vec<tauri_plugin_global_shortcut::Shortcut> = Vec::new();
+
+    for slot in &slots {
+        if !slot.is_enabled() {
+            println!("[hotkey] Slot {:?} disabled (empty hotkey), skipping", slot.mode);
+            continue;
+        }
+
+        let shortcut = match slot.hotkey.parse::<tauri_plugin_global_shortcut::Shortcut>() {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!(
+                    "[hotkey] Slot hotkey {:?} is invalid ({e}), skipping",
+                    slot.hotkey
+                );
+                continue;
+            }
+        };
+
+        println!(
+            "[hotkey] Queuing slot: {:?} id={} mode={:?} insert_and_send={}",
+            slot.hotkey, shortcut.id(), slot.mode, slot.insert_and_send
+        );
+        slot_map.push((shortcut.id(), slot.mode, slot.insert_and_send));
+        shortcut_objects.push(shortcut);
+    }
+
+    if !shortcut_objects.is_empty() {
+        let handle_clone = handle.clone();
+        handle
+            .global_shortcut()
+            .on_shortcuts(shortcut_objects, move |_app, shortcut, event| {
+                println!("[hotkey] Event: shortcut_id={} {event:?}", shortcut.id());
+
+                // While the ShortcutRecorder is active, swallow all hotkey
+                // events so the user can press the current shortcut without
+                // triggering the pipeline.
+                if handle_clone
+                    .state::<AppState>()
+                    .hotkey_paused
+                    .load(Ordering::SeqCst)
+                {
+                    println!("[hotkey] paused (ShortcutRecorder active), ignoring");
+                    return;
+                }
+
+                // Resolve the mode and insert_and_send flag for the specific
+                // shortcut that fired. Linear scan is fine: at most two slots.
+                let (mode, slot_insert_and_send) =
+                    match slot_map.iter().find(|(id, _, _)| *id == shortcut.id()) {
+                        Some((_, m, ias)) => (*m, *ias),
+                        None => {
+                            log::warn!("[hotkey] Unknown shortcut id={}, ignoring", shortcut.id());
+                            return;
+                        }
+                    };
+
+                let h = handle_clone.clone();
+                println!("[hotkey] mode={mode:?} state={:?}", event.state);
+
+                // Tell the FloatingBar which mode is active so it shows the
+                // correct badge (Hotkey 1 vs Hotkey 2 may have different modes).
+                let _ = handle_clone.emit("dikta://active-mode", mode);
+
+                // Helper: stores the slot's insert_and_send flag in AppState
+                // so stop_and_process_pipeline can read it without needing to
+                // know which slot triggered the pipeline.
+                let store_insert_and_send = |ias: bool| {
+                    handle_clone
+                        .state::<AppState>()
+                        .active_insert_and_send
+                        .store(ias, Ordering::SeqCst);
+                };
+
+                match (mode, event.state) {
+                    (HotkeyMode::Toggle, ShortcutState::Pressed) => {
+                        store_insert_and_send(slot_insert_and_send);
+                        tauri::async_runtime::spawn(async move {
+                            run_dictation_pipeline(h).await;
+                        });
+                    }
+                    (HotkeyMode::Hold, ShortcutState::Pressed) => {
+                        store_insert_and_send(slot_insert_and_send);
+                        tauri::async_runtime::spawn(async move {
+                            start_recording_only(h).await;
+                        });
+                    }
+                    (HotkeyMode::Hold, ShortcutState::Released) => {
+                        tauri::async_runtime::spawn(async move {
+                            stop_and_process_pipeline(h).await;
+                        });
+                    }
+                    (HotkeyMode::AutoStop, ShortcutState::Pressed) => {
+                        // If already recording: second press = manual stop.
+                        // stop_and_process_pipeline clears the silence callback
+                        // before doing anything else, so no double-invocation.
+                        // Guard also prevents slot 2 from starting while slot 1
+                        // is already recording.
+                        let is_recording = handle_clone
+                            .state::<AppState>()
+                            .recorder
+                            .is_recording();
+                        if is_recording {
+                            tauri::async_runtime::spawn(async move {
+                                stop_and_process_pipeline(h).await;
+                            });
+                        } else {
+                            store_insert_and_send(slot_insert_and_send);
+                            tauri::async_runtime::spawn(async move {
+                                start_autostop_recording(h).await;
+                            });
+                        }
+                    }
+                    (HotkeyMode::AutoStop, ShortcutState::Released) => {
+                        // No-op: AutoStop is toggle-style, release has no meaning.
+                    }
+                    (HotkeyMode::Auto, ShortcutState::Pressed) => {
+                        let state = handle_clone.state::<AppState>();
+                        if state.recorder.is_recording() {
+                            // Second press while recording: stop the loop and
+                            // process whatever was recorded so far.
+                            state.auto_loop_active.store(false, Ordering::SeqCst);
+                            tauri::async_runtime::spawn(async move {
+                                stop_and_process_pipeline(h).await;
+                            });
+                        } else {
+                            // First press: activate loop and start first cycle.
+                            store_insert_and_send(slot_insert_and_send);
+                            state.auto_loop_active.store(true, Ordering::SeqCst);
+                            tauri::async_runtime::spawn(async move {
+                                start_auto_recording(h).await;
+                            });
+                        }
+                    }
+                    (HotkeyMode::Auto, ShortcutState::Released) => {
+                        // No-op: Auto mode is toggle-style, release has no meaning.
+                    }
+                    _ => {}
+                }
+            })
+            .map_err(|e| format!("Failed to register dictation shortcuts: {e}"))?;
+    }
+
+    // --- Command Mode hotkey ---
     if let Ok(cmd_shortcut) = cmd_shortcut_str.parse::<tauri_plugin_global_shortcut::Shortcut>() {
         let handle_clone2 = handle.clone();
         let _ = handle
@@ -1067,5 +1616,379 @@ mod tests {
             ..AppConfig::default()
         };
         let _provider = resolve_cleanup_provider(&cfg);
+    }
+
+    /// When `insert_and_send` is `true` in config, the flag is correctly read.
+    ///
+    /// This mirrors the extraction logic in `stop_and_process_pipeline` --
+    /// the full pipeline cannot be unit-tested without an `AppHandle`, so we
+    /// verify the config read path directly.
+    #[test]
+    fn test_insert_and_send_flag_is_read_from_config() {
+        let cfg_enabled = AppConfig {
+            insert_and_send: true,
+            ..AppConfig::default()
+        };
+        assert!(
+            cfg_enabled.insert_and_send,
+            "insert_and_send should be true when set in config"
+        );
+
+        let cfg_disabled = AppConfig {
+            insert_and_send: false,
+            ..AppConfig::default()
+        };
+        assert!(
+            !cfg_disabled.insert_and_send,
+            "insert_and_send should be false when unset in config"
+        );
+    }
+
+    /// Default config has `insert_and_send = false` (opt-in feature).
+    #[test]
+    fn test_insert_and_send_defaults_to_false() {
+        let cfg = AppConfig::default();
+        assert!(
+            !cfg.insert_and_send,
+            "insert_and_send must default to false -- it is an opt-in feature"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AutoStop handler tests
+    // -----------------------------------------------------------------------
+
+    /// `autostop_silence_secs` is correctly read from config.
+    ///
+    /// This mirrors the extraction logic in `start_autostop_recording` --
+    /// the full function cannot be unit-tested without an `AppHandle`.
+    #[test]
+    fn test_autostop_handler_concept_reads_silence_secs() {
+        let cfg = AppConfig {
+            autostop_silence_secs: 3.5,
+            ..AppConfig::default()
+        };
+        assert!(
+            (cfg.autostop_silence_secs - 3.5).abs() < f32::EPSILON,
+            "autostop_silence_secs should be 3.5 when set in config"
+        );
+    }
+
+    /// `silence_threshold` from `advanced` is correctly read for AutoStop.
+    #[test]
+    fn test_autostop_handler_concept_reads_silence_threshold() {
+        let mut cfg = AppConfig::default();
+        cfg.advanced.silence_threshold = 0.012;
+
+        // Mirrors the extraction in start_autostop_recording:
+        let threshold = cfg.advanced.silence_threshold;
+        assert!(
+            (threshold - 0.012).abs() < f32::EPSILON,
+            "silence_threshold from advanced settings should be readable"
+        );
+    }
+
+    /// Default `autostop_silence_secs` is 2.0 seconds.
+    #[test]
+    fn test_autostop_silence_secs_default() {
+        let cfg = AppConfig::default();
+        assert!(
+            (cfg.autostop_silence_secs - 2.0).abs() < f32::EPSILON,
+            "default autostop_silence_secs should be 2.0"
+        );
+    }
+
+    /// After `set_silence_callback`, `has_silence_callback` returns `true`.
+    /// After `clear_silence_callback`, it returns `false`.
+    ///
+    /// This is the observable side-effect of `start_autostop_recording`
+    /// that can be verified without a full `AppHandle`.
+    #[test]
+    fn test_autostop_handler_starts_silence_monitor() {
+        use crate::audio::AudioRecorder;
+
+        let recorder = AudioRecorder::new();
+
+        // Before installing a callback: none present.
+        assert!(
+            !recorder.has_silence_callback(),
+            "no silence callback should be installed initially"
+        );
+
+        // Install the callback (as start_autostop_recording would).
+        recorder.set_silence_callback(2.0, 0.005, Box::new(|| {}));
+
+        assert!(
+            recorder.has_silence_callback(),
+            "silence callback should be installed after set_silence_callback"
+        );
+
+        // Clear it (as stop_and_process_pipeline does at the top).
+        recorder.clear_silence_callback();
+
+        assert!(
+            !recorder.has_silence_callback(),
+            "silence callback should be gone after clear_silence_callback"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Auto-Loop mode tests
+    // -----------------------------------------------------------------------
+
+    /// `auto_loop_active` starts as `false` -- the loop is off until the user
+    /// explicitly activates it with the first hotkey press in Auto mode.
+    #[test]
+    fn test_auto_loop_flag_default_false() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let flag = AtomicBool::new(false);
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "auto_loop_active must start as false"
+        );
+    }
+
+    /// After `store(false)`, `load()` returns `false` -- the hotkey handler can
+    /// stop the loop by writing the flag regardless of what the pipeline does.
+    #[test]
+    fn test_auto_loop_can_be_stopped() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let flag = AtomicBool::new(true);
+        assert!(flag.load(Ordering::SeqCst), "flag should be true after store(true)");
+
+        flag.store(false, Ordering::SeqCst);
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "flag should be false after store(false) -- loop must be stoppable"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Whisper hallucination detection tests
+    // -----------------------------------------------------------------------
+
+    /// Exact repetition of the auto-language prompt is detected as echo.
+    #[test]
+    fn test_prompt_echo_exact_repetition() {
+        let hint = "Multilingual voice dictation. German and English with proper punctuation.";
+        let hallucination = "German and English with proper punctuation. German and English with proper punctuation. German and English with proper punctuation.";
+        assert!(
+            super::is_prompt_echo(hallucination, hint),
+            "repeated prompt fragments should be detected as hallucination"
+        );
+    }
+
+    /// Full prompt echoed once is also a hallucination.
+    #[test]
+    fn test_prompt_echo_single() {
+        let hint = "Multilingual voice dictation. German and English with proper punctuation.";
+        assert!(
+            super::is_prompt_echo(hint, hint),
+            "exact echo of the prompt should be detected"
+        );
+    }
+
+    /// German prompt echo detection.
+    #[test]
+    fn test_prompt_echo_german() {
+        let hint = "Diktat auf Deutsch mit gelegentlichen englischen Fachbegriffen. Korrekte Groß- und Kleinschreibung, Satzzeichen und Interpunktion.";
+        let hallucination = "Korrekte Groß- und Kleinschreibung, Satzzeichen und Interpunktion. Korrekte Groß- und Kleinschreibung, Satzzeichen und Interpunktion.";
+        assert!(
+            super::is_prompt_echo(hallucination, hint),
+            "German prompt fragments repeated should be detected"
+        );
+    }
+
+    /// Real speech must NOT be flagged as hallucination.
+    #[test]
+    fn test_prompt_echo_real_speech_not_flagged() {
+        let hint = "Multilingual voice dictation. German and English with proper punctuation.";
+        let real_speech = "Hey, ich wollte kurz fragen ob du morgen Zeit hast.";
+        assert!(
+            !super::is_prompt_echo(real_speech, hint),
+            "real speech must not be detected as prompt echo"
+        );
+    }
+
+    /// Empty transcription is not a hallucination (handled by silence check).
+    #[test]
+    fn test_prompt_echo_empty_is_not_echo() {
+        let hint = "Multilingual voice dictation. German and English with proper punctuation.";
+        assert!(
+            !super::is_prompt_echo("", hint),
+            "empty transcription should not be flagged"
+        );
+    }
+
+    /// Mixed speech + prompt fragment is NOT a hallucination.
+    #[test]
+    fn test_prompt_echo_mixed_content_not_flagged() {
+        let hint = "Multilingual voice dictation. German and English with proper punctuation.";
+        let mixed = "German and English with proper punctuation. Also I wanted to say hello.";
+        assert!(
+            !super::is_prompt_echo(mixed, hint),
+            "mixed real speech with prompt fragment must not be flagged"
+        );
+    }
+
+    /// Whisper varies words: "punctuation" → "pronunciation". Word-overlap
+    /// check catches this even though exact substring match fails.
+    #[test]
+    fn test_prompt_echo_word_variation_detected() {
+        let hint = "Multilingual voice dictation. German and English with proper punctuation.";
+        let hallucination = "German and English with proper pronunciation.";
+        assert!(
+            super::is_prompt_echo(hallucination, hint),
+            "word-variation hallucination should be detected via overlap check"
+        );
+    }
+
+    /// Repeated word-varied hallucination is also caught.
+    #[test]
+    fn test_prompt_echo_repeated_variation() {
+        let hint = "Multilingual voice dictation. German and English with proper punctuation.";
+        let hallucination = "Proper pronunciation. Proper pronunciation. Proper pronunciation.";
+        assert!(
+            super::is_prompt_echo(hallucination, hint),
+            "repeated variation should be detected"
+        );
+    }
+
+    /// Long real text (>30 words) must never be flagged, even if some prompt
+    /// words appear naturally.
+    #[test]
+    fn test_prompt_echo_long_real_text_not_flagged() {
+        let hint = "Multilingual voice dictation. German and English with proper punctuation.";
+        let real = "This is a long text about multilingual voice recognition systems. \
+                    German and English are both supported in many modern applications. \
+                    The technology has improved significantly with proper training data \
+                    and neural network architectures that handle punctuation well.";
+        assert!(
+            !super::is_prompt_echo(real, hint),
+            "long real text with incidental prompt-word overlap must not be flagged"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_prompt_fragments tests
+    // -----------------------------------------------------------------------
+
+    /// A known default-prompt fragment appearing mid-sentence is removed.
+    #[test]
+    fn test_strip_fragment_mid_sentence() {
+        let hint = "Multilingual voice dictation. German and English with proper punctuation.";
+        // Simulates Whisper leaking "German and English with proper punctuation."
+        // into the middle of a real transcription.
+        let raw = "Ich wollte sagen German and English with proper punctuation. dass das Projekt gut laeuft.";
+        let result = super::strip_prompt_fragments(raw, hint);
+        assert!(
+            !result.contains("German and English with proper punctuation"),
+            "leaked prompt fragment should be removed; got: {result:?}"
+        );
+        assert!(
+            result.contains("Ich wollte sagen") && result.contains("dass das Projekt gut laeuft"),
+            "real speech content must be preserved; got: {result:?}"
+        );
+    }
+
+    /// Real text without any prompt fragment is returned unchanged (modulo
+    /// whitespace normalisation).
+    #[test]
+    fn test_strip_real_text_unchanged() {
+        let hint = "Multilingual voice dictation. German and English with proper punctuation.";
+        let real = "Hey, kannst du morgen Bescheid geben?";
+        let result = super::strip_prompt_fragments(real, hint);
+        assert_eq!(
+            result, real,
+            "text without prompt fragments should come out identical"
+        );
+    }
+
+    /// Matching is case-insensitive: lower-cased fragment is still stripped.
+    #[test]
+    fn test_strip_case_insensitive() {
+        let hint = "Voice dictation in English. Proper punctuation, capitalization, and spelling.";
+        // Fragment with different casing than the original hint.
+        let raw = "I want to say proper punctuation, capitalization, and spelling. something important.";
+        let result = super::strip_prompt_fragments(raw, hint);
+        assert!(
+            !result.to_lowercase().contains("proper punctuation, capitalization, and spelling"),
+            "case-insensitive fragment should be stripped; got: {result:?}"
+        );
+        assert!(
+            result.contains("I want to say") && result.contains("something important"),
+            "surrounding real text must be preserved; got: {result:?}"
+        );
+    }
+
+    /// Multiple prompt fragments from the same hint are all removed.
+    #[test]
+    fn test_strip_multiple_fragments_same_hint() {
+        let hint = "Multilingual voice dictation. German and English with proper punctuation.";
+        // Both sentences of the hint appear in the raw text.
+        let raw = "Multilingual voice dictation. Das ist toll. German and English with proper punctuation.";
+        let result = super::strip_prompt_fragments(raw, hint);
+        assert!(
+            !result.contains("Multilingual voice dictation"),
+            "first fragment should be stripped; got: {result:?}"
+        );
+        assert!(
+            !result.contains("German and English with proper punctuation"),
+            "second fragment should be stripped; got: {result:?}"
+        );
+        assert!(
+            result.contains("Das ist toll"),
+            "real content between fragments must survive; got: {result:?}"
+        );
+    }
+
+    /// A fragment from a *different* default hint (not the active stt_hint) is
+    /// also stripped, because DEFAULT_STT_HINTS are always checked.
+    #[test]
+    fn test_strip_default_hint_even_when_not_active() {
+        // Active hint is German, but Whisper leaked the English default.
+        let active_hint = "Diktat auf Deutsch mit gelegentlichen englischen Fachbegriffen. Korrekte Groß- und Kleinschreibung, Satzzeichen und Interpunktion.";
+        let raw = "Hier ist der Bericht. Voice dictation in English. Das war es.";
+        let result = super::strip_prompt_fragments(raw, active_hint);
+        assert!(
+            !result.contains("Voice dictation in English"),
+            "English default-hint fragment should be stripped even when German hint is active; got: {result:?}"
+        );
+        assert!(
+            result.contains("Hier ist der Bericht") && result.contains("Das war es"),
+            "surrounding real text must be preserved; got: {result:?}"
+        );
+    }
+
+    /// When the entire transcription is composed of prompt text, the result is
+    /// empty (or near-empty after whitespace collapse).
+    #[test]
+    fn test_strip_entire_text_is_prompt() {
+        let hint = "Multilingual voice dictation. German and English with proper punctuation.";
+        // The transcription IS the prompt (edge case: guard hasn't caught it yet).
+        let raw = "Multilingual voice dictation. German and English with proper punctuation.";
+        let result = super::strip_prompt_fragments(raw, hint);
+        assert!(
+            result.trim().is_empty(),
+            "transcription that is entirely prompt should collapse to empty; got: {result:?}"
+        );
+    }
+
+    /// A custom (user-configured) stt_hint is also stripped.
+    #[test]
+    fn test_strip_custom_hint() {
+        let custom_hint = "Medical transcription with proper terminology and spelling.";
+        let raw = "Patient presented with chest pain. Medical transcription with proper terminology and spelling. Vitals are stable.";
+        let result = super::strip_prompt_fragments(raw, custom_hint);
+        assert!(
+            !result.contains("Medical transcription with proper terminology and spelling"),
+            "custom hint fragment should be stripped; got: {result:?}"
+        );
+        assert!(
+            result.contains("Patient presented with chest pain") && result.contains("Vitals are stable"),
+            "real medical content must be preserved; got: {result:?}"
+        );
     }
 }

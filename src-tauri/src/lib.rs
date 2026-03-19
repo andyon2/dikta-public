@@ -56,6 +56,7 @@ mod test_helpers;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::AtomicBool;
 
 use audio::AudioRecorder;
 use config::{config_file_has_license_field, load_config, AppConfig, HotkeyMode};
@@ -70,8 +71,6 @@ use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WindowEvent};
 use tauri::menu::{Menu, MenuItem};
 #[cfg(desktop)]
 use tauri::tray::TrayIconEvent;
-#[cfg(desktop)]
-use tauri_plugin_global_shortcut::Shortcut;
 
 // Re-export pipeline helpers so `commands/` modules can reach them.
 pub use pipeline::{resolve_cleanup_provider, resolve_stt_provider};
@@ -155,6 +154,34 @@ pub struct SettingsView {
     pub local_whisper_model: String,
     /// Whether GPU acceleration (CUDA) is enabled for local whisper.
     pub local_whisper_gpu: bool,
+    /// Send Enter after pasting for hotkey slot 0.
+    /// Replaces the deprecated global `insert_and_send` field.
+    pub insert_and_send_slot1: bool,
+    /// Send Enter after pasting for hotkey slot 1.
+    pub insert_and_send_slot2: bool,
+    /// Silence duration (seconds) before AutoStop mode triggers stop + pipeline.
+    pub autostop_silence_secs: f32,
+    /// Silence duration (seconds) before Auto mode triggers stop + pipeline.
+    pub auto_mode_silence_secs: f32,
+    /// Hotkey string for the optional second slot (empty = slot disabled).
+    pub hotkey_slot2: String,
+    /// Recording mode for the optional second slot.
+    pub hotkey_mode_slot2: HotkeyMode,
+    /// Recording mode for the Android floating bubble.
+    /// Valid values: `"hold"`, `"toggle"`, `"autostop"`, `"auto"`.
+    pub bubble_recording_mode: String,
+    /// Recording mode for bubble single-tap gesture.
+    pub bubble_tap_mode: String,
+    /// Auto-send after paste for bubble tap gesture.
+    pub bubble_tap_auto_send: bool,
+    /// Silence duration (seconds) for auto-stop on bubble tap.
+    pub bubble_tap_silence_secs: f32,
+    /// Recording mode for bubble long-press gesture.
+    pub bubble_long_press_mode: String,
+    /// Auto-send after paste for bubble long-press gesture.
+    pub bubble_long_press_auto_send: bool,
+    /// Silence duration (seconds) for auto-stop on bubble long press.
+    pub bubble_long_press_silence_secs: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -199,6 +226,25 @@ pub struct AppState {
     /// Current license status, computed from config on startup and updated
     /// when the user validates or removes a key.
     pub license_status: Mutex<license::LicenseStatus>,
+    /// When `true`, the global hotkey handler ignores all key events.
+    /// Set by the frontend when the ShortcutRecorder is active, so the user
+    /// can press the current hotkey without triggering the pipeline.
+    pub hotkey_paused: AtomicBool,
+    /// Controls the Auto-Loop recording mode.
+    ///
+    /// Set to `true` when Auto mode is activated (first hotkey press).
+    /// Set to `false` when the user presses the hotkey again to stop the loop.
+    /// The pipeline itself never touches this flag -- only the hotkey handler
+    /// controls the loop lifecycle. `SeqCst` ordering ensures visibility across
+    /// the cpal OS-thread and the Tauri async runtime.
+    pub auto_loop_active: AtomicBool,
+    /// The `insert_and_send` flag from the slot that triggered the current
+    /// (or most recent) recording. Written by the hotkey handler when a slot
+    /// starts recording; read by `stop_and_process_pipeline` so the pipeline
+    /// knows whether to send Enter after pasting.
+    ///
+    /// Default: `false`. Reusing an `AtomicBool` keeps this lock-free.
+    pub active_insert_and_send: AtomicBool,
 }
 
 // SAFETY: All fields are either `Arc<_>`, `Mutex<_>`, or `RwLock<_>`, which
@@ -251,6 +297,9 @@ impl AppState {
             command_mode_active: Mutex::new(false),
             command_mode_selected_text: Mutex::new(None),
             license_status: Mutex::new(initial_license_status),
+            hotkey_paused: AtomicBool::new(false),
+            auto_loop_active: AtomicBool::new(false),
+            active_insert_and_send: AtomicBool::new(false),
         }
     }
 }
@@ -333,6 +382,51 @@ pub fn mask_api_key(key: &str) -> String {
     format!("****{}", &key[key.len() - 4..])
 }
 
+/// Updates the system tray icon tooltip to reflect the current pipeline state.
+///
+/// Tooltip strings per state:
+/// - idle / done  → "Dikta"
+/// - recording    → "Dikta — Recording..."
+/// - transcribing → "Dikta — Transcribing..."
+/// - cleaning     → "Dikta — Processing..."
+/// - error        → "Dikta — Error"
+///
+/// If the tray icon cannot be found, the failure is logged and ignored -- the
+/// app must not crash because the tray tooltip failed to update.
+#[cfg(desktop)]
+pub fn update_tray_tooltip(handle: &AppHandle, state: &hotkey::PipelineState) {
+    use tauri::Manager;
+
+    let tooltip = match state {
+        hotkey::PipelineState::Idle | hotkey::PipelineState::Done => "Dikta",
+        hotkey::PipelineState::Recording => "Dikta \u{2014} Recording...",
+        hotkey::PipelineState::Transcribing => "Dikta \u{2014} Transcribing...",
+        hotkey::PipelineState::Cleaning => "Dikta \u{2014} Processing...",
+        hotkey::PipelineState::Error => "Dikta \u{2014} Error",
+    };
+
+    match handle.tray_by_id("dikta-tray") {
+        Some(tray) => {
+            if let Err(e) = tray.set_tooltip(Some(tooltip)) {
+                log::warn!("[tray] Failed to set tooltip to {tooltip:?}: {e}");
+            }
+        }
+        None => {
+            log::debug!("[tray] Tray icon 'dikta-tray' not found, skipping tooltip update");
+        }
+    }
+}
+
+/// Emits a pipeline state-changed event and updates the tray tooltip
+/// to match the new state. This is the single call site for all state
+/// transitions so tray and frontend stay in sync automatically.
+pub fn emit_pipeline_state(handle: &AppHandle, event: hotkey::PipelineEvent) {
+    let pipeline_state = event.state.clone();
+    let _ = handle.emit(hotkey::EVENT_STATE_CHANGED, event);
+    #[cfg(desktop)]
+    update_tray_tooltip(handle, &pipeline_state);
+}
+
 /// Wraps an error message with a human-readable hint based on common HTTP/network
 /// error patterns. The hint is appended after the raw error string.
 pub fn friendly_error(context: &str, err: &str) -> String {
@@ -409,10 +503,23 @@ pub fn setup_audio_level_emitter(handle: &AppHandle) {
 
 #[cfg(desktop)]
 /// Creates the floating bar window positioned above the taskbar.
-fn create_bar_window(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    // Start as a thin idle pill -- the frontend resizes dynamically based on state.
+///
+/// `saved_x` / `saved_y`: persisted logical position from the config. When
+/// present they are used as-is; the work-area calculation is skipped. On
+/// first launch (both `None`) the position is derived from the Win32
+/// `SPI_GETWORKAREA` work area on Windows, or from the monitor bounds on
+/// other platforms.
+fn create_bar_window(
+    app: &tauri::App,
+    saved_x: Option<f64>,
+    saved_y: Option<f64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The window starts at idle size but the frontend expands it to pill size
+    // when active. Position calculations must use the PILL height so the
+    // expanded bar doesn't overlap the taskbar.
     let bar_width = 80.0_f64;
     let bar_height = 10.0_f64;
+    let pill_height = 36.0_f64;
 
     let mut builder = tauri::WebviewWindowBuilder::new(
         app,
@@ -447,7 +554,67 @@ fn create_bar_window(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>>
         }
     }
 
-    // Position at bottom-center of the current monitor, above the taskbar.
+    // --- Position the bar ---
+    //
+    // Priority:
+    //   1. Persisted config position  (user dragged the bar, we saved it)
+    //   2. Win32 SPI_GETWORKAREA      (correct usable area, excludes taskbar)
+    //   3. monitor.size() fallback    (60 px conservative taskbar estimate)
+    //   4. Hard-coded fallback        (no monitor detected at all)
+
+    if let (Some(cx), Some(cy)) = (saved_x, saved_y) {
+        log::info!("[bar] Using saved config position ({cx}, {cy})");
+        let _ = bar.set_position(tauri::LogicalPosition::new(cx, cy));
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SystemParametersInfoW, SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+        };
+
+        let mut work_area = RECT::default();
+        // SAFETY: `work_area` is a valid stack-allocated RECT; the Win32 call
+        // writes into it and we check the return value before using the data.
+        let ok = unsafe {
+            SystemParametersInfoW(
+                SPI_GETWORKAREA,
+                0,
+                Some(&raw mut work_area as *mut _),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            )
+        };
+
+        match ok {
+            Ok(()) => {
+                // `SPI_GETWORKAREA` returns physical pixels; divide by the bar
+                // window's scale factor to get logical coordinates that Tauri
+                // expects for `set_position`.
+                let scale = bar.scale_factor().unwrap_or(1.0);
+                let work_w = (work_area.right - work_area.left) as f64 / scale;
+                let work_bottom = work_area.bottom as f64 / scale;
+                let work_left = work_area.left as f64 / scale;
+
+                let x = work_left + (work_w - bar_width) / 2.0;
+                let y = work_bottom - pill_height - 8.0;
+
+                log::info!(
+                    "[bar] SPI_GETWORKAREA -> work_area=({},{},{},{}) scale={scale:.2}, placing at ({x:.1}, {y:.1})",
+                    work_area.left, work_area.top, work_area.right, work_area.bottom,
+                );
+                let _ = bar.set_position(tauri::LogicalPosition::new(x, y));
+                return Ok(());
+            }
+            Err(e) => {
+                log::warn!("[bar] SPI_GETWORKAREA failed ({e}), falling back to monitor size");
+            }
+        }
+    }
+
+    // Fallback: derive position from monitor bounds with a conservative
+    // 60 px taskbar estimate.
     match bar.current_monitor() {
         Ok(Some(monitor)) => {
             let screen_size = monitor.size();
@@ -458,14 +625,16 @@ fn create_bar_window(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>>
             let offset_x = monitor_pos.x as f64 / scale;
             let offset_y = monitor_pos.y as f64 / scale;
             let x = offset_x + (screen_w - bar_width) / 2.0;
-            let y = offset_y + screen_h - bar_height - 52.0;
+            // 60 px: conservative estimate for taskbar height at common DPI settings.
+            let y = offset_y + screen_h - pill_height - 60.0;
             log::info!(
-                "[bar] screen={screen_w}x{screen_h} scale={scale} offset=({offset_x},{offset_y}), placing at ({x}, {y})"
+                "[bar] monitor fallback: screen={screen_w}x{screen_h} scale={scale:.2} \
+                 offset=({offset_x},{offset_y}), placing at ({x:.1}, {y:.1})"
             );
             let _ = bar.set_position(tauri::LogicalPosition::new(x, y));
         }
         _ => {
-            log::warn!("[bar] No monitor detected, using fallback position");
+            log::warn!("[bar] No monitor detected, using hard-coded fallback position");
             let _ = bar.set_position(tauri::LogicalPosition::new(400.0, 10.0));
         }
     }
@@ -534,6 +703,10 @@ pub fn run() {
         // Apply autostart on launch: ensure registry entry matches config.
         commands::settings::apply_autostart(cfg.autostart);
 
+        // Extract bar position before `cfg` is moved into AppState.
+        let saved_bar_x = cfg.bar_x;
+        let saved_bar_y = cfg.bar_y;
+
         // Build and register the application state.
         let app_state = AppState::new(cfg, dictionary, app_data_dir, history_db, is_early_adopter);
         app.manage(app_state);
@@ -580,7 +753,7 @@ pub fn run() {
 
         // --- Floating bar window ---
         #[cfg(target_os = "windows")]
-        if let Err(e) = create_bar_window(app) {
+        if let Err(e) = create_bar_window(app, saved_bar_x, saved_bar_y) {
             log::warn!("[setup] Could not create floating bar: {e}");
         }
 
@@ -590,23 +763,11 @@ pub fn run() {
             let handle = app.handle().clone();
             setup_audio_level_emitter(&handle);
 
-            println!("[setup] Parsing hotkey: {hotkey_str:?}");
-            let shortcut = hotkey_str.parse::<Shortcut>().unwrap_or_else(|e| {
-                log::warn!(
-                    "[hotkey] Saved hotkey {:?} is invalid ({e}), falling back to default",
-                    hotkey_str
-                );
-                DEFAULT_HOTKEY
-                    .parse::<Shortcut>()
-                    .expect("DEFAULT_HOTKEY must be a valid shortcut string")
-            });
-
-            match register_hotkey(&handle, shortcut, hotkey_mode) {
-                Ok(()) => log::info!(
-                    "[hotkey] Registered shortcut: {hotkey_str} (mode={hotkey_mode:?})"
-                ),
+            println!("[setup] Registering hotkey slots from config");
+            match register_hotkey(&handle) {
+                Ok(()) => log::info!("[hotkey] Hotkey slots registered"),
                 Err(e) => log::warn!(
-                    "[hotkey] Could not register shortcut: {e}. Use the UI button instead."
+                    "[hotkey] Could not register hotkey slots: {e}. Use the UI button instead."
                 ),
             }
         }
@@ -666,6 +827,7 @@ pub fn run() {
             commands::settings::reformat_text,
             commands::settings::is_first_run,
             commands::settings::get_active_app,
+            commands::settings::set_hotkey_paused,
             commands::settings::get_advanced_settings,
             commands::settings::save_advanced_settings,
             // Dictionary
@@ -691,6 +853,8 @@ pub fn run() {
             commands::misc::sync_history,
             commands::recording::cancel_recording,
             commands::misc::set_bar_shape,
+            commands::misc::save_bar_position,
+            commands::misc::get_bar_position,
             // License
             commands::license::validate_license,
             commands::license::get_license_status,
@@ -799,6 +963,19 @@ mod tests {
             bubble_opacity: 0.85,
             local_whisper_model: "base".to_string(),
             local_whisper_gpu: true,
+            insert_and_send_slot1: false,
+            insert_and_send_slot2: false,
+            autostop_silence_secs: 2.0,
+            auto_mode_silence_secs: 2.0,
+            hotkey_slot2: String::new(),
+            hotkey_mode_slot2: HotkeyMode::Hold,
+            bubble_recording_mode: "hold".to_string(),
+            bubble_tap_mode: "toggle".to_string(),
+            bubble_tap_auto_send: false,
+            bubble_tap_silence_secs: 2.0,
+            bubble_long_press_mode: "hold".to_string(),
+            bubble_long_press_auto_send: false,
+            bubble_long_press_silence_secs: 2.0,
         };
         let json = serde_json::to_string(&view).unwrap();
         assert!(json.contains("groqApiKeyMasked"), "expected camelCase key");
@@ -840,6 +1017,19 @@ mod tests {
             bubble_opacity: 0.85,
             local_whisper_model: "base".to_string(),
             local_whisper_gpu: true,
+            insert_and_send_slot1: false,
+            insert_and_send_slot2: false,
+            autostop_silence_secs: 2.0,
+            auto_mode_silence_secs: 2.0,
+            hotkey_slot2: String::new(),
+            hotkey_mode_slot2: HotkeyMode::Hold,
+            bubble_recording_mode: "hold".to_string(),
+            bubble_tap_mode: "toggle".to_string(),
+            bubble_tap_auto_send: false,
+            bubble_tap_silence_secs: 2.0,
+            bubble_long_press_mode: "hold".to_string(),
+            bubble_long_press_auto_send: false,
+            bubble_long_press_silence_secs: 2.0,
         };
         let json = serde_json::to_string(&view).unwrap();
         assert!(
@@ -875,6 +1065,19 @@ mod tests {
             bubble_opacity: 0.85,
             local_whisper_model: "base".to_string(),
             local_whisper_gpu: true,
+            insert_and_send_slot1: false,
+            insert_and_send_slot2: false,
+            autostop_silence_secs: 2.0,
+            auto_mode_silence_secs: 2.0,
+            hotkey_slot2: String::new(),
+            hotkey_mode_slot2: HotkeyMode::Hold,
+            bubble_recording_mode: "hold".to_string(),
+            bubble_tap_mode: "toggle".to_string(),
+            bubble_tap_auto_send: false,
+            bubble_tap_silence_secs: 2.0,
+            bubble_long_press_mode: "hold".to_string(),
+            bubble_long_press_auto_send: false,
+            bubble_long_press_silence_secs: 2.0,
         };
         let json = serde_json::to_string(&view).unwrap();
         assert!(

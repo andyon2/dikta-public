@@ -143,6 +143,32 @@ pub async fn save_settings(
     local_whisper_gpu: Option<bool>,
     stt_provider: Option<String>,
     llm_provider: Option<String>,
+    insert_and_send: Option<bool>,
+    autostop_silence_secs: Option<f32>,
+    auto_mode_silence_secs: Option<f32>,
+    // Optional secondary hotkey string (slot 1). Empty string = disable slot.
+    // None = leave slot 1 unchanged.
+    hotkey_slot2: Option<String>,
+    // Optional recording mode for the secondary hotkey slot (slot 1).
+    // Passed as a string ("hold", "toggle", "autoStop", "auto") -- same
+    // encoding as the existing `hotkey_mode` parameter.
+    // None = leave slot 1 mode unchanged.
+    hotkey_mode_slot2: Option<String>,
+    // Whether to press Enter after pasting for slot 0. None = leave unchanged.
+    insert_and_send_slot1: Option<bool>,
+    // Whether to press Enter after pasting for slot 1. None = leave unchanged.
+    insert_and_send_slot2: Option<bool>,
+    // Recording mode for the Android floating bubble.
+    // Valid values: "hold", "toggle", "autostop", "auto".
+    // None = leave unchanged (backward-compatible with older frontend versions).
+    bubble_recording_mode: Option<String>,
+    // Per-gesture bubble controls. None = leave existing value unchanged.
+    bubble_tap_mode: Option<String>,
+    bubble_tap_auto_send: Option<bool>,
+    bubble_tap_silence_secs: Option<f32>,
+    bubble_long_press_mode: Option<String>,
+    bubble_long_press_auto_send: Option<bool>,
+    bubble_long_press_silence_secs: Option<f32>,
 ) -> Result<(), String> {
     let inner = state.inner();
 
@@ -151,15 +177,29 @@ pub async fn save_settings(
         require_license!(state, LicensedFeature::WhisperMode);
     }
 
-    // Validate the hotkey string before writing anything to disk (desktop only).
+    // Validate hotkey strings before writing anything to disk (desktop only).
+    // Slot 0 (`hotkey` param) is always validated. Slot 1 (`hotkey_slot2`) is
+    // only validated when non-empty -- empty string means "disable the slot".
     println!("[save_settings] hotkey={hotkey:?} mode={hotkey_mode:?}");
     #[cfg(desktop)]
-    let parsed_shortcut = hotkey
-        .parse::<tauri_plugin_global_shortcut::Shortcut>()
-        .map_err(|e| {
-            println!("[save_settings] Invalid shortcut: {e}");
-            format!("Invalid shortcut string: {e}")
-        })?;
+    {
+        hotkey
+            .parse::<tauri_plugin_global_shortcut::Shortcut>()
+            .map_err(|e| {
+                println!("[save_settings] Invalid shortcut: {e}");
+                format!("Invalid shortcut string: {e}")
+            })?;
+
+        if let Some(ref h2) = hotkey_slot2 {
+            if !h2.is_empty() {
+                h2.parse::<tauri_plugin_global_shortcut::Shortcut>()
+                    .map_err(|e| {
+                        println!("[save_settings] Invalid slot-2 shortcut: {e}");
+                        format!("Invalid slot-2 shortcut string: {e}")
+                    })?;
+            }
+        }
+    }
 
     // Build updated config. Empty API key strings preserve the existing key
     // so the user can change other settings without re-entering keys.
@@ -177,7 +217,7 @@ pub async fn save_settings(
         },
         language,
         cleanup_style,
-        hotkey,
+        hotkey: hotkey.clone(),
         hotkey_mode,
         audio_device,
         stt_model: stt_model.unwrap_or(existing.stt_model),
@@ -200,6 +240,43 @@ pub async fn save_settings(
         // so old config.json files round-trip cleanly
         stt_priority: existing.stt_priority,
         llm_priority: existing.llm_priority,
+        // Build the updated hotkey_slots:
+        // - Slot 0 is always updated from the `hotkey` / `hotkey_mode` parameters
+        //   (backward-compatible with any frontend that doesn't know about slots).
+        // - Slot 1 is updated only when `hotkey_slot2` is supplied; otherwise the
+        //   existing value is preserved so a settings save never silently wipes it.
+        hotkey_slots: {
+            let mut slots = existing.hotkey_slots.clone();
+
+            // Ensure the Vec is at least 2 elements long.
+            while slots.len() < 2 {
+                slots.push(crate::config::HotkeySlot {
+                    hotkey: String::new(),
+                    mode: crate::config::HotkeyMode::Hold,
+                    insert_and_send: false,
+                });
+            }
+
+            // Slot 0 -- always updated from the `hotkey` / `hotkey_mode` params.
+            slots[0].hotkey = hotkey.clone();
+            slots[0].mode = hotkey_mode;
+            if let Some(v) = insert_and_send_slot1 {
+                slots[0].insert_and_send = v;
+            }
+
+            // Slot 1 -- updated only when the caller explicitly passes a value.
+            if let Some(ref h2) = hotkey_slot2 {
+                slots[1].hotkey = h2.clone();
+            }
+            if let Some(ref m2_str) = hotkey_mode_slot2 {
+                slots[1].mode = m2_str.parse().unwrap_or(crate::config::HotkeyMode::Hold);
+            }
+            if let Some(v) = insert_and_send_slot2 {
+                slots[1].insert_and_send = v;
+            }
+
+            slots
+        },
         output_language: output_language.unwrap_or(existing.output_language),
         snippets: existing.snippets,
         voice_notes_hotkey: existing.voice_notes_hotkey,
@@ -221,6 +298,21 @@ pub async fn save_settings(
         local_whisper_gpu: local_whisper_gpu.unwrap_or(existing.local_whisper_gpu),
         license_key: existing.license_key,
         license_validated_at: existing.license_validated_at,
+        bar_x: existing.bar_x,
+        bar_y: existing.bar_y,
+        insert_and_send: insert_and_send.unwrap_or(existing.insert_and_send),
+        autostop_silence_secs: autostop_silence_secs.unwrap_or(existing.autostop_silence_secs),
+        auto_mode_silence_secs: auto_mode_silence_secs.unwrap_or(existing.auto_mode_silence_secs),
+        bubble_recording_mode: bubble_recording_mode.unwrap_or(existing.bubble_recording_mode),
+        bubble_tap_mode: bubble_tap_mode.unwrap_or(existing.bubble_tap_mode),
+        bubble_tap_auto_send: bubble_tap_auto_send.unwrap_or(existing.bubble_tap_auto_send),
+        bubble_tap_silence_secs: bubble_tap_silence_secs
+            .unwrap_or(existing.bubble_tap_silence_secs),
+        bubble_long_press_mode: bubble_long_press_mode.unwrap_or(existing.bubble_long_press_mode),
+        bubble_long_press_auto_send: bubble_long_press_auto_send
+            .unwrap_or(existing.bubble_long_press_auto_send),
+        bubble_long_press_silence_secs: bubble_long_press_silence_secs
+            .unwrap_or(existing.bubble_long_press_silence_secs),
     };
 
     // Resolve providers from the new config before persisting.
@@ -238,9 +330,9 @@ pub async fn save_settings(
     *crate::write_lock!(inner.stt_provider)? = new_stt;
     *crate::write_lock!(inner.cleanup_provider)? = new_cleanup;
 
-    // Re-register the global shortcut with the (possibly new) hotkey + mode (desktop only).
+    // Re-register all hotkey slots from the (now-updated) in-memory config (desktop only).
     #[cfg(desktop)]
-    crate::pipeline::register_hotkey(&handle, parsed_shortcut, hotkey_mode)?;
+    crate::pipeline::register_hotkey(&handle)?;
 
     // Apply autostart: write or remove the OS startup entry.
     let autostart_enabled = crate::lock!(inner.config)?.autostart;
@@ -257,13 +349,37 @@ pub async fn save_settings(
 pub fn get_settings(state: State<'_, AppState>) -> Result<SettingsView, String> {
     let cfg = crate::lock!(state.inner().config)?.clone();
 
+    // Pull slot 0 (primary) and slot 1 (secondary) out of hotkey_slots.
+    // Fall back to the legacy flat fields for slot 0 in case the Vec is empty
+    // (should not happen after migration, but be defensive).
+    let slot0_hotkey = cfg
+        .hotkey_slots
+        .get(0)
+        .map(|s| s.hotkey.clone())
+        .unwrap_or_else(|| cfg.hotkey.clone());
+    let slot0_mode = cfg
+        .hotkey_slots
+        .get(0)
+        .map(|s| s.mode)
+        .unwrap_or(cfg.hotkey_mode);
+    let slot1_hotkey = cfg
+        .hotkey_slots
+        .get(1)
+        .map(|s| s.hotkey.clone())
+        .unwrap_or_default();
+    let slot1_mode = cfg
+        .hotkey_slots
+        .get(1)
+        .map(|s| s.mode)
+        .unwrap_or(config::HotkeyMode::Hold);
+
     Ok(SettingsView {
         groq_api_key_masked: mask_api_key(&cfg.groq_api_key),
         deepseek_api_key_masked: mask_api_key(&cfg.deepseek_api_key),
         language: cfg.language,
         cleanup_style: cfg.cleanup_style,
-        hotkey: cfg.hotkey,
-        hotkey_mode: cfg.hotkey_mode,
+        hotkey: slot0_hotkey,
+        hotkey_mode: slot0_mode,
         audio_device: cfg.audio_device,
         stt_model: cfg.stt_model,
         custom_prompt: cfg.custom_prompt,
@@ -282,6 +398,19 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<SettingsView, String> 
         bubble_opacity: cfg.bubble_opacity,
         local_whisper_model: cfg.local_whisper_model,
         local_whisper_gpu: cfg.local_whisper_gpu,
+        insert_and_send_slot1: cfg.hotkey_slots.get(0).map(|s| s.insert_and_send).unwrap_or(false),
+        insert_and_send_slot2: cfg.hotkey_slots.get(1).map(|s| s.insert_and_send).unwrap_or(false),
+        autostop_silence_secs: cfg.autostop_silence_secs,
+        auto_mode_silence_secs: cfg.auto_mode_silence_secs,
+        hotkey_slot2: slot1_hotkey,
+        hotkey_mode_slot2: slot1_mode,
+        bubble_recording_mode: cfg.bubble_recording_mode,
+        bubble_tap_mode: cfg.bubble_tap_mode,
+        bubble_tap_auto_send: cfg.bubble_tap_auto_send,
+        bubble_tap_silence_secs: cfg.bubble_tap_silence_secs,
+        bubble_long_press_mode: cfg.bubble_long_press_mode,
+        bubble_long_press_auto_send: cfg.bubble_long_press_auto_send,
+        bubble_long_press_silence_secs: cfg.bubble_long_press_silence_secs,
     })
 }
 
@@ -426,6 +555,8 @@ pub fn set_output_language(state: State<'_, AppState>, language: String) -> Resu
 ///
 /// `shortcut`: a Tauri shortcut string, e.g. `"ctrl+shift+d"`.
 /// `mode`: `HotkeyMode::Hold` or `HotkeyMode::Toggle`.
+/// `slot_index`: which slot to update (0 = primary, 1 = secondary). Defaults
+///   to 0 when `None` -- so existing callers remain backward-compatible.
 ///
 /// Returns an error if the shortcut string is invalid or registration fails.
 /// Persists both the new shortcut and mode to config.
@@ -435,25 +566,53 @@ pub async fn set_hotkey(
     state: State<'_, AppState>,
     shortcut: String,
     mode: HotkeyMode,
+    slot_index: Option<u8>,
 ) -> Result<(), String> {
-    // Validate and register the shortcut (desktop only).
+    let idx = slot_index.unwrap_or(0) as usize;
+
+    // Only validate non-empty shortcuts; an empty string for slot 1 means
+    // "disable this slot" and does not need to parse as a valid shortcut.
     #[cfg(desktop)]
-    {
-        let parsed = shortcut
+    if !shortcut.is_empty() {
+        shortcut
             .parse::<tauri_plugin_global_shortcut::Shortcut>()
             .map_err(|e| format!("Invalid shortcut string: {e}"))?;
-        crate::pipeline::register_hotkey(&handle, parsed, mode)?;
     }
 
-    // Persist both fields to config.
     let inner = state.inner();
-    let mut cfg = crate::lock!(inner.config)?;
-    cfg.hotkey = shortcut;
-    cfg.hotkey_mode = mode;
-    let cfg_clone = cfg.clone();
-    drop(cfg);
-    save_config(&inner.app_data_dir, &cfg_clone)
-        .map_err(|e| format!("Failed to persist hotkey setting: {e}"))
+    {
+        let mut cfg = crate::lock!(inner.config)?;
+
+        // Ensure the Vec is at least (idx + 1) elements long.
+        while cfg.hotkey_slots.len() <= idx {
+            cfg.hotkey_slots.push(crate::config::HotkeySlot {
+                hotkey: String::new(),
+                mode: crate::config::HotkeyMode::Hold,
+                insert_and_send: false,
+            });
+        }
+
+        // Update the target slot.
+        cfg.hotkey_slots[idx].hotkey = shortcut.clone();
+        cfg.hotkey_slots[idx].mode = mode;
+
+        // Keep the legacy flat fields in sync for slot 0 (config.json round-trip).
+        if idx == 0 {
+            cfg.hotkey = shortcut.clone();
+            cfg.hotkey_mode = mode;
+        }
+
+        let cfg_clone = cfg.clone();
+        drop(cfg);
+        save_config(&inner.app_data_dir, &cfg_clone)
+            .map_err(|e| format!("Failed to persist hotkey setting: {e}"))?;
+    }
+
+    // Re-register all hotkey slots from the updated config (desktop only).
+    #[cfg(desktop)]
+    crate::pipeline::register_hotkey(&handle)?;
+
+    Ok(())
 }
 
 /// Reformats text into a specific output format (email, bullets, summary).
@@ -497,4 +656,252 @@ pub fn is_first_run(state: State<'_, AppState>) -> bool {
 #[tauri::command]
 pub fn get_active_app(state: State<'_, AppState>) -> Option<String> {
     state.prev_window_title.lock().ok().and_then(|t| t.clone())
+}
+
+/// Pauses or resumes the global hotkey handler.
+///
+/// Called by the frontend ShortcutRecorder when it enters/exits listening mode.
+/// While paused, all global hotkey events are silently swallowed so the user
+/// can press the current shortcut without triggering the pipeline.
+#[tauri::command]
+pub fn set_hotkey_paused(state: State<'_, AppState>, paused: bool) {
+    state
+        .hotkey_paused
+        .store(paused, std::sync::atomic::Ordering::SeqCst);
+    log::debug!("[settings] hotkey_paused = {paused}");
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use crate::config::{load_config, save_config, AppConfig};
+
+    fn temp_dir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("tempdir creation failed")
+    }
+
+    /// The three new recording-mode fields (`insert_and_send`,
+    /// `autostop_silence_secs`, `auto_mode_silence_secs`) survive a
+    /// save → load round-trip through `config.json`.
+    ///
+    /// This validates that `save_settings` can persist these fields and
+    /// `get_settings` will return them correctly (both delegate to
+    /// `AppConfig`/`save_config`/`load_config`).
+    #[test]
+    fn test_save_settings_persists_recording_mode_fields() {
+        let dir = temp_dir();
+
+        let cfg = AppConfig {
+            insert_and_send: true,
+            autostop_silence_secs: 1.5,
+            auto_mode_silence_secs: 3.5,
+            ..AppConfig::default()
+        };
+
+        save_config(dir.path(), &cfg).expect("save_config should succeed");
+        let loaded = load_config(dir.path());
+
+        // Migration: global insert_and_send=true is moved to slots, global reset to false
+        assert!(
+            !loaded.insert_and_send,
+            "global insert_and_send should be false after migration to slots"
+        );
+        assert!(
+            loaded.hotkey_slots.iter().all(|s| s.insert_and_send),
+            "all slots should have insert_and_send=true after migration"
+        );
+        assert!(
+            (loaded.autostop_silence_secs - 1.5).abs() < f32::EPSILON,
+            "autostop_silence_secs should round-trip to 1.5, got {}",
+            loaded.autostop_silence_secs
+        );
+        assert!(
+            (loaded.auto_mode_silence_secs - 3.5).abs() < f32::EPSILON,
+            "auto_mode_silence_secs should round-trip to 3.5, got {}",
+            loaded.auto_mode_silence_secs
+        );
+    }
+
+    /// `bubble_recording_mode` defaults to `"hold"` when the field is absent
+    /// from an old config.json (backward-compatibility).
+    #[test]
+    fn test_bubble_recording_mode_default_value() {
+        assert_eq!(
+            AppConfig::default().bubble_recording_mode,
+            "hold",
+            "bubble_recording_mode must default to \"hold\""
+        );
+    }
+
+    /// `bubble_recording_mode` survives a save → load round-trip intact.
+    #[test]
+    fn test_bubble_recording_mode_roundtrip() {
+        let dir = temp_dir();
+
+        let cfg = AppConfig {
+            bubble_recording_mode: "toggle".to_string(),
+            ..AppConfig::default()
+        };
+
+        save_config(dir.path(), &cfg).expect("save_config should succeed");
+        let loaded = load_config(dir.path());
+
+        assert_eq!(
+            loaded.bubble_recording_mode, "toggle",
+            "bubble_recording_mode should round-trip as \"toggle\""
+        );
+    }
+
+    /// Old config.json without the six new bubble gesture fields loads correctly
+    /// and returns the documented defaults for each field.
+    #[test]
+    fn test_bubble_gesture_fields_default_when_absent_from_json() {
+        let dir = temp_dir();
+
+        // Minimal config -- none of the new bubble gesture fields are present.
+        let partial = r#"{"language": "de"}"#;
+        std::fs::write(dir.path().join("config.json"), partial.as_bytes())
+            .expect("write partial config");
+
+        let loaded = load_config(dir.path());
+
+        assert_eq!(
+            loaded.bubble_tap_mode, "toggle",
+            "bubble_tap_mode must default to \"toggle\""
+        );
+        assert!(
+            !loaded.bubble_tap_auto_send,
+            "bubble_tap_auto_send must default to false"
+        );
+        assert!(
+            (loaded.bubble_tap_silence_secs - 2.0).abs() < f32::EPSILON,
+            "bubble_tap_silence_secs must default to 2.0, got {}",
+            loaded.bubble_tap_silence_secs
+        );
+        assert_eq!(
+            loaded.bubble_long_press_mode, "hold",
+            "bubble_long_press_mode must default to \"hold\""
+        );
+        assert!(
+            !loaded.bubble_long_press_auto_send,
+            "bubble_long_press_auto_send must default to false"
+        );
+        assert!(
+            (loaded.bubble_long_press_silence_secs - 2.0).abs() < f32::EPSILON,
+            "bubble_long_press_silence_secs must default to 2.0, got {}",
+            loaded.bubble_long_press_silence_secs
+        );
+    }
+
+    /// Round-trip: serialize AppConfig with non-default bubble gesture values,
+    /// then reload from disk -- all six fields must survive intact.
+    #[test]
+    fn test_bubble_gesture_fields_roundtrip() {
+        let dir = temp_dir();
+
+        let cfg = AppConfig {
+            bubble_tap_mode: "autostop".to_string(),
+            bubble_tap_auto_send: true,
+            bubble_tap_silence_secs: 1.5,
+            bubble_long_press_mode: "auto".to_string(),
+            bubble_long_press_auto_send: true,
+            bubble_long_press_silence_secs: 3.5,
+            ..AppConfig::default()
+        };
+
+        save_config(dir.path(), &cfg).expect("save_config should succeed");
+        let loaded = load_config(dir.path());
+
+        assert_eq!(loaded.bubble_tap_mode, "autostop");
+        assert!(loaded.bubble_tap_auto_send);
+        assert!(
+            (loaded.bubble_tap_silence_secs - 1.5).abs() < f32::EPSILON,
+            "bubble_tap_silence_secs should be 1.5, got {}",
+            loaded.bubble_tap_silence_secs
+        );
+        assert_eq!(loaded.bubble_long_press_mode, "auto");
+        assert!(loaded.bubble_long_press_auto_send);
+        assert!(
+            (loaded.bubble_long_press_silence_secs - 3.5).abs() < f32::EPSILON,
+            "bubble_long_press_silence_secs should be 3.5, got {}",
+            loaded.bubble_long_press_silence_secs
+        );
+    }
+
+    /// When `bubble_recording_mode` is absent from JSON (old config file),
+    /// `load_config` returns `"hold"` as the default -- no crash, no data loss.
+    #[test]
+    fn test_bubble_recording_mode_defaults_when_absent_from_json() {
+        let dir = temp_dir();
+
+        // Write a minimal config that does not contain the new field.
+        let partial = r#"{"language": "de"}"#;
+        std::fs::write(dir.path().join("config.json"), partial.as_bytes())
+            .expect("write partial config");
+
+        let loaded = load_config(dir.path());
+
+        assert_eq!(
+            loaded.bubble_recording_mode, "hold",
+            "bubble_recording_mode should default to \"hold\" when absent from config"
+        );
+    }
+
+    /// `insert_and_send` is stored per-slot. Verify that per-slot values
+    /// survive a save → load round-trip independently.
+    #[test]
+    fn test_insert_and_send_per_slot_roundtrip() {
+        use crate::config::{HotkeyMode, HotkeySlot};
+
+        let dir = temp_dir();
+
+        let mut cfg = AppConfig::default();
+        // Slot 0: insert_and_send = true, slot 1: insert_and_send = false.
+        cfg.hotkey_slots = vec![
+            HotkeySlot { hotkey: "ctrl+shift+d".to_string(), mode: HotkeyMode::Hold, insert_and_send: true },
+            HotkeySlot { hotkey: "ctrl+shift+e".to_string(), mode: HotkeyMode::Toggle, insert_and_send: false },
+        ];
+
+        save_config(dir.path(), &cfg).expect("save_config should succeed");
+        let loaded = load_config(dir.path());
+
+        assert!(
+            loaded.hotkey_slots[0].insert_and_send,
+            "slot 0 insert_and_send should be true after round-trip"
+        );
+        assert!(
+            !loaded.hotkey_slots[1].insert_and_send,
+            "slot 1 insert_and_send should be false after round-trip"
+        );
+    }
+
+    /// When `insert_and_send` is omitted from the saved JSON (old config),
+    /// it defaults to `false` -- no migration step needed.
+    #[test]
+    fn test_save_settings_recording_mode_defaults_when_absent() {
+        let dir = temp_dir();
+
+        // Write a minimal config without the new fields.
+        let partial = r#"{"language": "de"}"#;
+        std::fs::write(dir.path().join("config.json"), partial.as_bytes())
+            .expect("write partial config");
+
+        let loaded = load_config(dir.path());
+
+        assert!(
+            !loaded.insert_and_send,
+            "insert_and_send should default to false when absent from config"
+        );
+        assert!(
+            (loaded.autostop_silence_secs - 2.0).abs() < f32::EPSILON,
+            "autostop_silence_secs should default to 2.0 when absent"
+        );
+        assert!(
+            (loaded.auto_mode_silence_secs - 2.0).abs() < f32::EPSILON,
+            "auto_mode_silence_secs should default to 2.0 when absent"
+        );
+    }
 }

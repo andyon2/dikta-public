@@ -26,11 +26,13 @@ import kotlin.math.abs
  *   KEYBOARD_ONLY (default): bubble appears only when the soft keyboard is visible.
  *   ALWAYS_VISIBLE: bubble is always on screen, regardless of keyboard state.
  *
- * Touch gestures in IDLE state:
- *   Single tap  -> start recording, bubble expands to pill bar with [X] [waveform] [✓]
- *   Long-press  -> push-to-talk: start recording immediately, release finger = confirm
+ * Recording modes (switchable via notification action):
+ *   HOLD:     Tap -> bar with [X][waveform][✓], Long-press -> PTT (hold to record)
+ *   TOGGLE:   Tap -> start (red circle), Tap again -> stop + process
+ *   AUTOSTOP: Tap -> start, auto-stops after silence detected
+ *   AUTO:     Tap -> start loop, auto-stops on silence then restarts, Tap -> stop loop
  *
- * Touch gestures in RECORDING state (bar mode):
+ * Touch gestures in RECORDING state (bar mode, HOLD only):
  *   Tap left zone  (X button)  -> cancel: stop recording, discard audio
  *   Tap right zone (✓ button)  -> confirm: stop recording, start STT + cleanup pipeline
  *   Drag                       -> moves the bar (drag threshold still applies)
@@ -49,7 +51,7 @@ class DiktaOverlayService : Service() {
         /** SharedPreference key: if true the bubble is always visible, not just when keyboard is open. */
         const val PREF_ALWAYS_VISIBLE = "bubble_always_visible"
 
-        /** BroadcastReceiver action: tap on notification toggles bubble visibility. */
+        /** BroadcastReceiver actions. */
         const val ACTION_TOGGLE_BUBBLE = "com.dikta.voice.TOGGLE_BUBBLE"
 
         // Keyboard detection: poll InputMethodManager at this interval (ms)
@@ -63,6 +65,28 @@ class DiktaOverlayService : Service() {
 
         /** Live reference used by DiktaAccessibilityService for paste. */
         var instance: DiktaOverlayService? = null
+    }
+
+    enum class RecordingMode(val label: String, val badge: String) {
+        HOLD("Hold", "H"),
+        TOGGLE("Toggle", "T"),
+        AUTOSTOP("Auto Stop", "S"),
+        AUTO("Auto", "A");
+
+        fun next(): RecordingMode = entries[(ordinal + 1) % entries.size]
+
+        companion object {
+            /**
+             * Maps a config string (case-insensitive) to a RecordingMode.
+             * Falls back to HOLD for unknown values.
+             */
+            fun fromString(value: String): RecordingMode = when (value.lowercase()) {
+                "toggle"   -> TOGGLE
+                "autostop" -> AUTOSTOP
+                "auto"     -> AUTO
+                else       -> HOLD
+            }
+        }
     }
 
     private enum class RecordingState { IDLE, RECORDING, RECORDING_PTT, PROCESSING }
@@ -109,6 +133,26 @@ class DiktaOverlayService : Service() {
     // Loaded from config.json; defaults to 0.85 if config is unavailable.
     private var bubbleOpacity = 0.85f
 
+    // Per-gesture recording modes: tap and long-press are configured independently.
+    private var tapMode = RecordingMode.TOGGLE
+    private var longPressMode = RecordingMode.HOLD
+
+    // Per-gesture auto-send and silence-detection settings.
+    private var tapAutoSend = false
+    private var longPressAutoSend = false
+    private var tapSilenceSecs = 2.0f
+    private var longPressSilenceSecs = 2.0f
+
+    /**
+     * Tracks which gesture started the current recording session.
+     * Used to select the correct silenceSecs / autoSend values when stopping.
+     * "tap" or "longpress"; null when not recording.
+     */
+    private var activeGesture: String? = null
+
+    // Auto-mode loop: true while the auto-loop is active (records, processes, repeats)
+    private var autoLoopActive = false
+
     // Long-press / push-to-talk state
     private var longPressTriggered = false
 
@@ -121,20 +165,27 @@ class DiktaOverlayService : Service() {
     private val longPressRunnable = Runnable {
         if (!isDragging && currentState == RecordingState.IDLE) {
             longPressTriggered = true
-            pushToTalkActive   = true
+            activeGesture      = "longpress"
+            // Re-read config before deciding behavior.
+            loadBubbleControls()
+            // Only activate push-to-talk (stop on finger lift) when longPressMode is HOLD.
+            pushToTalkActive = (longPressMode == RecordingMode.HOLD)
+            // Enable auto-loop when longPressMode is AUTO.
+            if (longPressMode == RecordingMode.AUTO) {
+                autoLoopActive = true
+            }
             startRecording()
         }
     }
 
     /**
-     * Receives ACTION_TOGGLE_BUBBLE from the foreground notification's contentIntent.
+     * Receives broadcast actions from the foreground notification.
      * Registered/unregistered dynamically -- no manifest entry needed.
+     * Only handles ACTION_TOGGLE_BUBBLE (mode switching removed).
      */
-    private val toggleBubbleReceiver = object : BroadcastReceiver() {
+    private val notificationActionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == ACTION_TOGGLE_BUBBLE) {
-                toggleBubble()
-            }
+            if (intent?.action == ACTION_TOGGLE_BUBBLE) toggleBubble()
         }
     }
 
@@ -157,14 +208,17 @@ class DiktaOverlayService : Service() {
             WindowManager.LayoutParams.TYPE_PHONE
         }
 
+        loadBubbleControls()
         createNotificationChannel()
         startForegroundWithNotification()
 
-        val filter = IntentFilter(ACTION_TOGGLE_BUBBLE)
+        val filter = IntentFilter().apply {
+            addAction(ACTION_TOGGLE_BUBBLE)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(toggleBubbleReceiver, filter, RECEIVER_NOT_EXPORTED)
+            registerReceiver(notificationActionReceiver, filter, RECEIVER_NOT_EXPORTED)
         } else {
-            registerReceiver(toggleBubbleReceiver, filter)
+            registerReceiver(notificationActionReceiver, filter)
         }
 
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
@@ -185,9 +239,9 @@ class DiktaOverlayService : Service() {
         handler.removeCallbacks(keyboardCheckRunnable)
         handler.removeCallbacks(longPressRunnable)
         try {
-            unregisterReceiver(toggleBubbleReceiver)
+            unregisterReceiver(notificationActionReceiver)
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to unregister toggleBubbleReceiver (already unregistered?)", e)
+            Log.w(TAG, "Failed to unregister notificationActionReceiver (already unregistered?)", e)
         }
         audioRecorder?.releaseImmediately()
         audioRecorder = null
@@ -222,8 +276,10 @@ class DiktaOverlayService : Service() {
     }
 
     private fun buildNotification(): Notification {
-        val statusText = if (isBubbleVisible) "Tap to hide bubble" else "Tap to show bubble"
+        // Show current per-gesture mode configuration as status text.
+        val statusText = "Tap: ${tapMode.label}, Hold: ${longPressMode.label}"
 
+        // Tap on notification body = toggle bubble visibility
         val toggleIntent = Intent(ACTION_TOGGLE_BUBBLE).apply { setPackage(packageName) }
         val pendingToggle = PendingIntent.getBroadcast(
             this, 0, toggleIntent,
@@ -236,13 +292,14 @@ class DiktaOverlayService : Service() {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
         }
-        return builder
-            .setContentTitle("Dikta - Voice Dictation")
+        builder
+            .setContentTitle("Dikta")
             .setContentText(statusText)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentIntent(pendingToggle)
             .setOngoing(true)
-            .build()
+
+        return builder.build()
     }
 
     private fun updateNotification() {
@@ -259,6 +316,28 @@ class DiktaOverlayService : Service() {
             )
         } else {
             startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    // --- Recording controls ---
+
+    /**
+     * Loads per-gesture recording controls from config.json.
+     * Replaces the old single-mode loadRecordingMode().
+     */
+    private fun loadBubbleControls() {
+        val config = DiktaApi.readConfig(this)
+        if (config != null) {
+            tapMode = RecordingMode.fromString(config.bubbleTapMode)
+            longPressMode = RecordingMode.fromString(config.bubbleLongPressMode)
+            // Auto-send disabled on Android — Enter key rarely works in mobile apps.
+            tapAutoSend = false
+            longPressAutoSend = false
+            tapSilenceSecs = config.bubbleTapSilenceSecs
+            longPressSilenceSecs = config.bubbleLongPressSilenceSecs
+            Log.d(TAG, "loadBubbleControls: tap=${config.bubbleTapMode}→$tapMode, lp=${config.bubbleLongPressMode}→$longPressMode, tapAutoSend=$tapAutoSend, lpAutoSend=$longPressAutoSend")
+        } else {
+            Log.w(TAG, "loadBubbleControls: config is NULL, using defaults tap=$tapMode, lp=$longPressMode")
         }
     }
 
@@ -330,6 +409,7 @@ class DiktaOverlayService : Service() {
     private fun showBubble() {
         if (!isBubbleVisible && ::bubbleView.isInitialized) {
             try {
+                reloadBubbleAppearance()
                 windowManager.addView(bubbleView, bubbleParams)
                 isBubbleVisible = true
                 updateNotification()
@@ -546,29 +626,65 @@ class DiktaOverlayService : Service() {
     /**
      * Handles a tap (no drag, no long-press).
      *
-     * In IDLE state:
-     *   - Single tap -> start recording
+     * Behavior depends on [tapMode]:
      *
-     * In RECORDING state:
-     *   - Tap in left zone (X) -> cancel recording
-     *   - Tap in right zone (✓) -> confirm recording
-     *   - Tap in middle zone  -> ignored
+     * HOLD mode:
+     *   IDLE -> expand to bar with [X][waveform][✓]
+     *   RECORDING -> tap cancel/confirm zones
      *
-     * In PROCESSING state: taps are ignored.
+     * TOGGLE / AUTOSTOP mode:
+     *   IDLE -> start recording (red circle, no bar)
+     *   RECORDING -> stop + process
+     *
+     * AUTO mode:
+     *   IDLE -> start auto-loop (records, processes, repeats until tapped again)
+     *   RECORDING -> stop loop + process current segment
      *
      * @param touchX Touch x-coordinate relative to the view's left edge.
      */
     private fun handleTap(touchX: Float) {
         when (currentState) {
-            RecordingState.IDLE -> startRecording()
+            RecordingState.IDLE -> {
+                activeGesture = "tap"
+                // Reload config before checking mode so Settings changes apply immediately.
+                loadBubbleControls()
+                if (tapMode == RecordingMode.AUTO) {
+                    autoLoopActive = true
+                }
+                startRecording()
+            }
             RecordingState.RECORDING -> {
-                when {
-                    bubbleView.isTouchInCancelZone(touchX)  -> cancelRecording()
-                    bubbleView.isTouchInConfirmZone(touchX) -> stopAndProcessRecording()
-                    // Middle zone tap: ignore
+                when (tapMode) {
+                    RecordingMode.HOLD -> {
+                        when {
+                            bubbleView.isTouchInCancelZone(touchX)  -> cancelRecording()
+                            bubbleView.isTouchInConfirmZone(touchX) -> stopAndProcessRecording()
+                            // Middle zone tap: ignore
+                        }
+                    }
+                    RecordingMode.TOGGLE, RecordingMode.AUTOSTOP -> {
+                        stopAndProcessRecording()
+                    }
+                    RecordingMode.AUTO -> {
+                        autoLoopActive = false
+                        stopAndProcessRecording()
+                    }
                 }
             }
-            RecordingState.RECORDING_PTT -> { /* PTT: ignore taps, release handles it */ }
+            RecordingState.RECORDING_PTT -> {
+                if (!pushToTalkActive) {
+                    // Not actual PTT -- this is TOGGLE/AUTOSTOP/AUTO using circular visual
+                    when (tapMode) {
+                        RecordingMode.TOGGLE, RecordingMode.AUTOSTOP -> stopAndProcessRecording()
+                        RecordingMode.AUTO -> {
+                            autoLoopActive = false
+                            stopAndProcessRecording()
+                        }
+                        else -> { /* HOLD PTT: ignore taps, release handles it */ }
+                    }
+                }
+                // If pushToTalkActive: ignore taps, finger release handles it
+            }
             RecordingState.PROCESSING -> { /* ignore */ }
         }
     }
@@ -576,8 +692,31 @@ class DiktaOverlayService : Service() {
     // --- Audio recording ---
 
     private fun startRecording() {
-        val recorder = DiktaAudioRecorder { amplitude ->
-            handler.post { bubbleView.amplitude = amplitude }
+        // Re-read config so any Settings changes take effect immediately.
+        loadBubbleControls()
+
+        // Determine which mode governs this recording session.
+        val activeMode = when (activeGesture) {
+            "longpress" -> longPressMode
+            else        -> tapMode  // "tap" or null (auto-loop restart)
+        }
+
+        // Select silence threshold for this gesture.
+        val activeSilenceSecs = when (activeGesture) {
+            "longpress" -> longPressSilenceSecs
+            else        -> tapSilenceSecs
+        }
+
+        val recorder = DiktaAudioRecorder(
+            onAmplitude = { amplitude -> handler.post { bubbleView.amplitude = amplitude } },
+            silenceSecs = activeSilenceSecs
+        )
+
+        // Wire up silence detection for AUTOSTOP / AUTO modes.
+        if (activeMode == RecordingMode.AUTOSTOP || activeMode == RecordingMode.AUTO) {
+            recorder.onSilenceDetected = {
+                handler.post { onSilenceTriggered() }
+            }
         }
 
         try {
@@ -591,13 +730,46 @@ class DiktaOverlayService : Service() {
         audioRecorder = recorder
         val previousState = currentState
 
-        if (pushToTalkActive) {
-            // PTT mode: bubble stays circular (no bar expansion), just turns red + scales up.
-            // adjustLayoutForState is intentionally skipped -- view size does not change.
-            setState(RecordingState.RECORDING_PTT)
-        } else {
-            setState(RecordingState.RECORDING)
-            adjustLayoutForState(RecordingState.RECORDING, previousState)
+        when {
+            pushToTalkActive -> {
+                // PTT mode: bubble stays circular (no bar expansion), just turns red + scales up.
+                setState(RecordingState.RECORDING_PTT)
+            }
+            activeMode == RecordingMode.HOLD -> {
+                // HOLD: expand to bar with cancel/confirm buttons
+                setState(RecordingState.RECORDING)
+                adjustLayoutForState(RecordingState.RECORDING, previousState)
+            }
+            else -> {
+                // TOGGLE / AUTOSTOP / AUTO: red circle, no bar
+                setState(RecordingState.RECORDING_PTT)
+            }
+        }
+    }
+
+    /**
+     * Called when silence detection fires (AUTOSTOP / AUTO modes only).
+     * Must be called on the main thread.
+     */
+    private fun onSilenceTriggered() {
+        if (currentState != RecordingState.RECORDING && currentState != RecordingState.RECORDING_PTT) return
+
+        val activeMode = when (activeGesture) {
+            "longpress" -> longPressMode
+            else        -> tapMode
+        }
+
+        when (activeMode) {
+            RecordingMode.AUTOSTOP -> {
+                stopAndProcessRecording()
+            }
+            RecordingMode.AUTO -> {
+                // Stop current segment and process it, then start a new recording
+                // if the auto-loop is still active.
+                stopAndProcessRecording()
+                // processAudio will call onProcessingComplete which handles the loop restart.
+            }
+            else -> { /* should not happen */ }
         }
     }
 
@@ -608,6 +780,7 @@ class DiktaOverlayService : Service() {
     private fun cancelRecording() {
         val recorder = audioRecorder ?: return
         audioRecorder = null
+        autoLoopActive = false
 
         // Release the recorder on a background thread (stop() can block briefly)
         Thread {
@@ -649,6 +822,7 @@ class DiktaOverlayService : Service() {
         if (wavBytes.isEmpty()) {
             handler.post {
                 showToast("No audio recorded")
+                autoLoopActive = false
                 val prev = currentState
                 setState(RecordingState.IDLE)
                 adjustLayoutForState(RecordingState.IDLE, prev)
@@ -660,6 +834,7 @@ class DiktaOverlayService : Service() {
         if (config == null || config.groqApiKey.isBlank()) {
             handler.post {
                 showToast("No API keys configured. Please open Dikta and add your Groq key in Settings.")
+                autoLoopActive = false
                 val prev = currentState
                 setState(RecordingState.IDLE)
                 adjustLayoutForState(RecordingState.IDLE, prev)
@@ -674,6 +849,7 @@ class DiktaOverlayService : Service() {
             if (transcript.isBlank()) {
                 handler.post {
                     showToast("No speech detected")
+                    autoLoopActive = false
                     val prev = currentState
                     setState(RecordingState.IDLE)
                     adjustLayoutForState(RecordingState.IDLE, prev)
@@ -707,6 +883,8 @@ class DiktaOverlayService : Service() {
             DiktaApi.pushToTurso(this, config.tursoUrl, config.tursoToken)
 
             // Step 4: Copy to clipboard and paste
+            // Capture activeGesture before posting to main thread (it may change on next gesture).
+            val gesture = activeGesture
             handler.post {
                 copyToClipboard(finalText)
 
@@ -719,12 +897,35 @@ class DiktaOverlayService : Service() {
                 val prev = currentState
                 setState(RecordingState.IDLE)
                 adjustLayoutForState(RecordingState.IDLE, prev)
+
+                // Auto-send (press Enter) if configured for this gesture.
+                val shouldAutoSend = when (gesture) {
+                    "tap"       -> tapAutoSend
+                    "longpress" -> longPressAutoSend
+                    else        -> false
+                }
+                if (shouldAutoSend && pasted) {
+                    // Short delay so the pasted text is committed before Enter fires.
+                    handler.postDelayed({
+                        DiktaAccessibilityService.instance?.performEnter()
+                    }, 150)
+                }
+
+                // AUTO mode: restart recording for next segment
+                val activeMode = when (gesture) {
+                    "longpress" -> longPressMode
+                    else        -> tapMode
+                }
+                if (autoLoopActive && activeMode == RecordingMode.AUTO) {
+                    startRecording()
+                }
             }
 
         } catch (e: IOException) {
             Log.w(TAG, "STT/API pipeline failed", e)
             handler.post {
                 showToast("Error: ${e.message?.take(80)}")
+                autoLoopActive = false
                 val prev = currentState
                 setState(RecordingState.IDLE)
                 adjustLayoutForState(RecordingState.IDLE, prev)
@@ -756,7 +957,7 @@ class DiktaOverlayService : Service() {
     }
 
     /**
-     * Re-reads bubble size and opacity from config.json and applies them live.
+     * Re-reads bubble size, opacity, and recording controls from config.json.
      * Called on every return to IDLE so Settings changes take effect after the next dictation.
      */
     private fun reloadBubbleAppearance() {
@@ -766,6 +967,8 @@ class DiktaOverlayService : Service() {
         bubbleView.setBubbleSize(newSizeDp)
         bubbleView.alpha = bubbleOpacity
         updateBubbleLayout()
+        loadBubbleControls()
+        updateNotification()
     }
 
     private fun copyToClipboard(text: String) {

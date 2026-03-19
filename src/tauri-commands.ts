@@ -67,6 +67,18 @@ const MOCK_SETTINGS: AppSettings = {
   bubbleOpacity: 90,
   localWhisperModel: "small",
   localWhisperGpu: false,
+  insertAndSendSlot1: false,
+  insertAndSendSlot2: false,
+  autostopSilenceSecs: 2.0,
+  autoModeSilenceSecs: 2.0,
+  hotkeySlot2: "",
+  hotkeyModeSlot2: "hold",
+  bubbleTapMode: "toggle",
+  bubbleTapAutoSend: false,
+  bubbleTapSilenceSecs: 2.0,
+  bubbleLongPressMode: "hold",
+  bubbleLongPressAutoSend: false,
+  bubbleLongPressSilenceSecs: 2.0,
 };
 
 const MOCK_ADVANCED_SETTINGS: AdvancedSettings = {
@@ -255,6 +267,18 @@ export async function saveSettings(
   localWhisperGpu?: boolean | null,
   sttProvider?: string | null,
   llmProvider?: string | null,
+  insertAndSendSlot1?: boolean | null,
+  autostopSilenceSecs?: number | null,
+  autoModeSilenceSecs?: number | null,
+  hotkey_slot2?: string | null,
+  hotkey_mode_slot2?: HotkeyMode | null,
+  insertAndSendSlot2?: boolean | null,
+  bubbleTapMode?: string | null,
+  bubbleTapAutoSend?: boolean | null,
+  bubbleTapSilenceSecs?: number | null,
+  bubbleLongPressMode?: string | null,
+  bubbleLongPressAutoSend?: boolean | null,
+  bubbleLongPressSilenceSecs?: number | null,
 ): Promise<void> {
   if (isPreviewMode) return mockAsync(undefined);
   await invoke("save_settings", {
@@ -283,6 +307,18 @@ export async function saveSettings(
     localWhisperGpu: localWhisperGpu ?? null,
     sttProvider: sttProvider ?? null,
     llmProvider: llmProvider ?? null,
+    insertAndSendSlot1: insertAndSendSlot1 ?? null,
+    autostopSilenceSecs: autostopSilenceSecs ?? null,
+    autoModeSilenceSecs: autoModeSilenceSecs ?? null,
+    hotkeySlot2: hotkey_slot2 ?? null,
+    hotkeyModeSlot2: hotkey_mode_slot2 ?? null,
+    insertAndSendSlot2: insertAndSendSlot2 ?? null,
+    bubbleTapMode: bubbleTapMode ?? null,
+    bubbleTapAutoSend: bubbleTapAutoSend ?? null,
+    bubbleTapSilenceSecs: bubbleTapSilenceSecs ?? null,
+    bubbleLongPressMode: bubbleLongPressMode ?? null,
+    bubbleLongPressAutoSend: bubbleLongPressAutoSend ?? null,
+    bubbleLongPressSilenceSecs: bubbleLongPressSilenceSecs ?? null,
   });
 }
 
@@ -695,4 +731,26 @@ export async function getLicenseStatus(): Promise<string> {
 export async function removeLicense(): Promise<void> {
   if (isPreviewMode) return mockAsync(undefined);
   await invoke("remove_license");
+}
+
+// --- Bar position ---
+
+/**
+ * Persists the floating bar window position (logical pixels) to disk.
+ * Called after every drag-end so the bar reopens at the same spot.
+ * @param x - Logical x coordinate of the window's top-left corner
+ * @param y - Logical y coordinate of the window's top-left corner
+ */
+export async function saveBarPosition(x: number, y: number): Promise<void> {
+  if (isPreviewMode) return mockAsync(undefined);
+  await invoke("save_bar_position", { x, y });
+}
+
+/**
+ * Returns the last persisted bar position, or null when no position has been
+ * saved yet (first run or after a reset).
+ */
+export async function getBarPosition(): Promise<{ x: number; y: number } | null> {
+  if (isPreviewMode) return mockAsync(null);
+  return invoke<{ x: number; y: number } | null>("get_bar_position");
 }

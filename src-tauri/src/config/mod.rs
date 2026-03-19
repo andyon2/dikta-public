@@ -322,6 +322,8 @@ pub struct AppProfile {
 ///
 /// - `Toggle`: one press starts recording, the next press stops and processes.
 /// - `Hold`: hold the key to record; releasing triggers stop + pipeline.
+/// - `AutoStop`: press once to start; recording stops automatically on silence.
+/// - `Auto`: like AutoStop but loops continuously -- press again to exit.
 ///
 /// Default is `Hold` -- this matches the Wispr Flow UX that users expect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -329,12 +331,83 @@ pub struct AppProfile {
 pub enum HotkeyMode {
     Toggle,
     Hold,
+    AutoStop,
+    Auto,
 }
 
 impl Default for HotkeyMode {
     fn default() -> Self {
         HotkeyMode::Hold
     }
+}
+
+impl std::str::FromStr for HotkeyMode {
+    type Err = String;
+
+    /// Parses a case-insensitive mode string as produced by the frontend:
+    /// `"hold"`, `"toggle"`, `"autostop"` / `"autoStop"`, `"auto"`.
+    ///
+    /// Returns `Err` for unknown strings.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "hold" => Ok(HotkeyMode::Hold),
+            "toggle" => Ok(HotkeyMode::Toggle),
+            "autostop" => Ok(HotkeyMode::AutoStop),
+            "auto" => Ok(HotkeyMode::Auto),
+            other => Err(format!("Unknown HotkeyMode: {other:?}")),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HotkeySlot
+// ---------------------------------------------------------------------------
+
+/// One configurable hotkey binding with its own recording mode.
+///
+/// `AppConfig` holds two slots (`hotkey_slots`). Slot 0 is the primary
+/// dictation hotkey; slot 1 is an optional secondary binding (e.g. for a
+/// different mode or language). An empty `hotkey` string means the slot is
+/// disabled.
+///
+/// # Migration note
+/// The old flat `hotkey` / `hotkey_mode` fields on `AppConfig` are preserved
+/// as deprecated fallbacks. `load_config` migrates them into slot 0 when
+/// `hotkey_slots` is absent from an old config file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HotkeySlot {
+    /// Tauri shortcut string (e.g. `"ctrl+shift+d"`). Empty = slot disabled.
+    pub hotkey: String,
+    /// How this slot triggers recording.
+    pub mode: HotkeyMode,
+    /// When `true`, the pipeline sends a Return key press after pasting text.
+    /// Useful for chat apps where Enter submits the message. Defaults to `false`
+    /// so existing configs are unaffected.
+    #[serde(default)]
+    pub insert_and_send: bool,
+}
+
+impl HotkeySlot {
+    /// Returns `true` if this slot has a non-empty hotkey string.
+    pub fn is_enabled(&self) -> bool {
+        !self.hotkey.is_empty()
+    }
+}
+
+fn default_hotkey_slots() -> Vec<HotkeySlot> {
+    vec![
+        HotkeySlot {
+            hotkey: default_hotkey(),
+            mode: HotkeyMode::Hold,
+            insert_and_send: false,
+        },
+        HotkeySlot {
+            hotkey: String::new(), // slot 2 disabled by default
+            mode: HotkeyMode::Hold,
+            insert_and_send: false,
+        },
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -394,12 +467,31 @@ pub struct AppConfig {
     pub cleanup_style: CleanupStyle,
 
     /// Global hotkey string in Tauri shortcut format (e.g. `"ctrl+shift+d"`).
+    ///
+    /// Deprecated: superseded by `hotkey_slots`. Kept as a migration fallback
+    /// so that old config.json files load without data loss. New code should
+    /// read from `hotkey_slots[0]` instead.
     #[serde(default = "default_hotkey")]
     pub hotkey: String,
 
     /// How the hotkey triggers recording: toggle (press/press) or hold (hold/release).
+    ///
+    /// Deprecated: superseded by `hotkey_slots`. Kept as a migration fallback.
+    /// New code should read `hotkey_slots[0].mode` instead.
     #[serde(default = "default_hotkey_mode")]
     pub hotkey_mode: HotkeyMode,
+
+    /// Dual hotkey slots. Each slot has its own key binding and recording mode.
+    ///
+    /// - Slot 0 (`hotkey_slots[0]`): primary dictation hotkey.
+    /// - Slot 1 (`hotkey_slots[1]`): optional secondary binding. An empty
+    ///   `hotkey` string means the slot is disabled.
+    ///
+    /// When absent from an old config.json the migration in `load_config`
+    /// populates slot 0 from the deprecated `hotkey` / `hotkey_mode` fields
+    /// (or from the compiled-in defaults) and sets slot 1 to disabled.
+    #[serde(default)]
+    pub hotkey_slots: Vec<HotkeySlot>,
 
     /// Name of the selected audio input device. `None` = system default.
     #[serde(default)]
@@ -529,6 +621,94 @@ pub struct AppConfig {
     /// 0 = never validated.
     #[serde(default)]
     pub license_validated_at: u64,
+
+    // --- Floating bar position ---
+
+    /// Deprecated: superseded by `HotkeySlot::insert_and_send`.
+    ///
+    /// Kept as a migration tombstone so that old config.json files load
+    /// without data loss. `load_config` propagates this value to all slots
+    /// when the slots do not yet carry their own `insertAndSend` flag
+    /// (i.e. when the slot was serialised by an older binary).
+    ///
+    /// New code must NOT write to this field -- write to the slot instead.
+    #[serde(default)]
+    pub insert_and_send: bool,
+
+    /// Silence duration (seconds) before AutoStop mode triggers stop + pipeline.
+    /// Default: 2.0 seconds.
+    #[serde(default = "default_autostop_silence_secs")]
+    pub autostop_silence_secs: f32,
+
+    /// Silence duration (seconds) before Auto mode triggers stop + pipeline
+    /// (and then restarts listening). Default: 2.0 seconds.
+    #[serde(default = "default_auto_mode_silence_secs")]
+    pub auto_mode_silence_secs: f32,
+
+    /// Last saved X position of the floating bar window (logical pixels).
+    /// `None` = no saved position; the app will use the default placement
+    /// (bottom-center of the primary monitor above the taskbar).
+    #[serde(default)]
+    pub bar_x: Option<f64>,
+
+    /// Last saved Y position of the floating bar window (logical pixels).
+    /// `None` = no saved position; paired with `bar_x` -- both are set or
+    /// neither is set.
+    #[serde(default)]
+    pub bar_y: Option<f64>,
+
+    /// Recording mode for the Android floating bubble.
+    ///
+    /// Valid values: `"hold"`, `"toggle"`, `"autostop"`, `"auto"`.
+    /// Default: `"hold"`.
+    ///
+    /// Kotlin reads this field directly from config.json, so it must remain a
+    /// plain String (not a Rust enum) to avoid deserialization coupling between
+    /// the two runtimes.
+    ///
+    /// Note: the desktop equivalent is `HotkeyMode` inside `hotkey_slots`.
+    /// This field is Android-only; desktop code should ignore it.
+    #[serde(default = "default_bubble_recording_mode")]
+    pub bubble_recording_mode: String,
+
+    // --- Android bubble per-gesture controls ---
+    //
+    // The six fields below replace the single `bubble_recording_mode` field
+    // with per-gesture configuration. `bubble_recording_mode` is kept for
+    // backwards compatibility with existing config files and Kotlin code that
+    // has not yet been updated to read the new fields.
+
+    /// Recording mode triggered by a single tap on the Android bubble.
+    /// Valid values: `"hold"`, `"toggle"`, `"autostop"`, `"auto"`.
+    /// Default: `"toggle"`.
+    #[serde(default = "default_bubble_tap_mode")]
+    pub bubble_tap_mode: String,
+
+    /// When `true`, the pipeline automatically sends (presses Enter) after
+    /// pasting for the bubble tap gesture. Default: `false`.
+    #[serde(default)]
+    pub bubble_tap_auto_send: bool,
+
+    /// Silence duration (seconds) before AutoStop / Auto mode stops recording
+    /// when triggered by a bubble tap. Default: 2.0 seconds.
+    #[serde(default = "default_bubble_silence_secs")]
+    pub bubble_tap_silence_secs: f32,
+
+    /// Recording mode triggered by a long press on the Android bubble.
+    /// Valid values: `"hold"`, `"toggle"`, `"autostop"`, `"auto"`.
+    /// Default: `"hold"`.
+    #[serde(default = "default_bubble_long_press_mode")]
+    pub bubble_long_press_mode: String,
+
+    /// When `true`, the pipeline automatically sends (presses Enter) after
+    /// pasting for the bubble long-press gesture. Default: `false`.
+    #[serde(default)]
+    pub bubble_long_press_auto_send: bool,
+
+    /// Silence duration (seconds) before AutoStop / Auto mode stops recording
+    /// when triggered by a bubble long press. Default: 2.0 seconds.
+    #[serde(default = "default_bubble_silence_secs")]
+    pub bubble_long_press_silence_secs: f32,
 }
 
 fn default_stt_provider() -> String {
@@ -591,6 +771,32 @@ fn default_bubble_opacity() -> f32 {
     0.85
 }
 
+fn default_autostop_silence_secs() -> f32 {
+    2.0
+}
+
+fn default_auto_mode_silence_secs() -> f32 {
+    2.0
+}
+
+fn default_bubble_recording_mode() -> String {
+    "hold".to_string()
+}
+
+fn default_bubble_tap_mode() -> String {
+    "toggle".to_string()
+}
+
+fn default_bubble_long_press_mode() -> String {
+    "hold".to_string()
+}
+
+/// Shared default silence duration (seconds) for bubble gesture auto-stop.
+/// Used by both `bubble_tap_silence_secs` and `bubble_long_press_silence_secs`.
+fn default_bubble_silence_secs() -> f32 {
+    2.0
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         AppConfig {
@@ -606,6 +812,7 @@ impl Default for AppConfig {
             cleanup_style: default_cleanup_style(),
             hotkey: default_hotkey(),
             hotkey_mode: default_hotkey_mode(),
+            hotkey_slots: default_hotkey_slots(),
             audio_device: None,
             stt_model: default_stt_model(),
             custom_prompt: String::new(),
@@ -627,6 +834,18 @@ impl Default for AppConfig {
             local_whisper_gpu: default_local_whisper_gpu(),
             license_key: String::new(),
             license_validated_at: 0,
+            insert_and_send: false,
+            autostop_silence_secs: default_autostop_silence_secs(),
+            auto_mode_silence_secs: default_auto_mode_silence_secs(),
+            bar_x: None,
+            bar_y: None,
+            bubble_recording_mode: default_bubble_recording_mode(),
+            bubble_tap_mode: default_bubble_tap_mode(),
+            bubble_tap_auto_send: false,
+            bubble_tap_silence_secs: default_bubble_silence_secs(),
+            bubble_long_press_mode: default_bubble_long_press_mode(),
+            bubble_long_press_auto_send: false,
+            bubble_long_press_silence_secs: default_bubble_silence_secs(),
         }
     }
 }
@@ -768,6 +987,84 @@ pub fn load_config(app_data_dir: &Path) -> AppConfig {
     }
 
     // ---------------------------------------------------------------------------
+    // Migration: hotkey / hotkey_mode → hotkey_slots
+    //
+    // In the dual-hotkey redesign we replaced the flat `hotkey` / `hotkey_mode`
+    // fields with `hotkey_slots: Vec<HotkeySlot>`. Old config files have the
+    // flat fields but no `hotkey_slots` key, so serde assigns an empty Vec via
+    // the `#[serde(default)]` annotation.
+    //
+    // When we detect an empty slots list we populate it from the legacy fields:
+    //   - Slot 0: hotkey + hotkey_mode (or the compiled-in defaults if those
+    //     fields are also missing / empty).
+    //   - Slot 1: disabled (empty hotkey string).
+    //
+    // This is intentionally a one-way migration: once hotkey_slots is written
+    // to disk the flat fields are no longer consulted. We do NOT clear the flat
+    // fields -- they stay as tombstones so truly old binaries can still read a
+    // value from them (forward-compat).
+    // ---------------------------------------------------------------------------
+    if config.hotkey_slots.is_empty() {
+        let slot0_hotkey = if config.hotkey.is_empty() {
+            default_hotkey()
+        } else {
+            config.hotkey.clone()
+        };
+        let slot0_mode = config.hotkey_mode;
+
+        log::info!(
+            "[config] Migrated legacy hotkey=\"{slot0_hotkey}\" mode={slot0_mode:?} to hotkey_slots[0]"
+        );
+
+        config.hotkey_slots = vec![
+            HotkeySlot {
+                hotkey: slot0_hotkey,
+                mode: slot0_mode,
+                insert_and_send: false,
+            },
+            HotkeySlot {
+                hotkey: String::new(), // slot 1 disabled
+                mode: HotkeyMode::Hold,
+                insert_and_send: false,
+            },
+        ];
+
+        // Persist immediately so future starts skip this migration path.
+        if let Err(e) = save_config(app_data_dir, &config) {
+            log::warn!("[config] Failed to persist hotkey_slots migration: {e}");
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Migration: global `insert_and_send` → per-slot `insert_and_send`
+    //
+    // In the per-slot redesign we moved `insert_and_send` from `AppConfig` into
+    // each `HotkeySlot`. Old config files may have the global flag set but the
+    // slots still have their serde default (`false`).
+    //
+    // We detect this by checking whether the global flag is `true` while ALL
+    // slots still carry the default value (`false`). In that case we propagate
+    // the global value to all slots and clear the global flag.
+    //
+    // If any slot already has `insert_and_send = true` (set by a newer binary),
+    // we leave everything as-is to avoid overwriting intentional per-slot config.
+    // ---------------------------------------------------------------------------
+    if config.insert_and_send && config.hotkey_slots.iter().all(|s| !s.insert_and_send) {
+        log::info!(
+            "[config] Migrated global insert_and_send=true to {} slot(s)",
+            config.hotkey_slots.len()
+        );
+        for slot in &mut config.hotkey_slots {
+            slot.insert_and_send = true;
+        }
+        // Clear the global flag so we no longer re-trigger this migration.
+        config.insert_and_send = false;
+        if let Err(e) = save_config(app_data_dir, &config) {
+            log::warn!("[config] Failed to persist insert_and_send slot migration: {e}");
+        }
+    }
+
+    // ---------------------------------------------------------------------------
     // Validation: reject unknown provider values and fall back to defaults.
     // ---------------------------------------------------------------------------
     const VALID_STT_PROVIDERS: &[&str] = &["groq", "openai", "local"];
@@ -787,6 +1084,48 @@ pub fn load_config(app_data_dir: &Path) -> AppConfig {
             config.llm_provider
         );
         config.llm_provider = default_llm_provider();
+    }
+
+    // ---------------------------------------------------------------------------
+    // Auto-fallback: if the chosen llm_provider has no API key, switch to the
+    // first alternative that does have a key.
+    //
+    // This avoids a confusing 401 error for users who set up Groq/OpenAI but
+    // left DeepSeek (the default) unconfigured.  We only auto-switch when the
+    // current provider's key is EMPTY; an explicit choice with a present key is
+    // never touched.
+    //
+    // Preference order for the fallback search: deepseek, openai, groq, anthropic
+    // (same as VALID_LLM_PROVIDERS order so the "best" provider wins first).
+    // If every key is empty we leave the config as-is -- the user will get a
+    // clear error at runtime when they actually trigger cleanup.
+    // ---------------------------------------------------------------------------
+    let current_key_empty = match config.llm_provider.as_str() {
+        "deepseek"  => config.deepseek_api_key.is_empty(),
+        "openai"    => config.openai_api_key.is_empty(),
+        "anthropic" => config.anthropic_api_key.is_empty(),
+        "groq"      => config.groq_api_key.is_empty(),
+        _           => false, // already validated above; unreachable in practice
+    };
+
+    if current_key_empty {
+        // Walk the preference list and pick the first provider that has a key.
+        let candidates: &[(&str, &str)] = &[
+            ("deepseek",  &config.deepseek_api_key),
+            ("openai",    &config.openai_api_key),
+            ("groq",      &config.groq_api_key),
+            ("anthropic", &config.anthropic_api_key),
+        ];
+        if let Some((name, _)) = candidates
+            .iter()
+            .find(|(n, k)| *n != config.llm_provider.as_str() && !k.is_empty())
+        {
+            let old = config.llm_provider.clone();
+            config.llm_provider = name.to_string();
+            log::info!(
+                "[config] llm_provider \"{old}\" has no API key, auto-switching to \"{name}\""
+            );
+        }
     }
 
     config
@@ -919,6 +1258,10 @@ mod tests {
             cleanup_style: CleanupStyle::Chat,
             hotkey: "ctrl+alt+r".to_string(),
             hotkey_mode: HotkeyMode::Toggle,
+            hotkey_slots: vec![
+                HotkeySlot { hotkey: "ctrl+alt+r".to_string(), mode: HotkeyMode::Toggle, insert_and_send: true },
+                HotkeySlot { hotkey: String::new(), mode: HotkeyMode::Hold, insert_and_send: true },
+            ],
             audio_device: Some("Test Mic".to_string()),
             stt_model: "whisper-large-v3".to_string(),
             custom_prompt: "Always use formal language.".to_string(),
@@ -956,6 +1299,18 @@ mod tests {
             local_whisper_gpu: false,
             license_key: String::new(),
             license_validated_at: 0,
+            insert_and_send: true,
+            autostop_silence_secs: 1.5,
+            auto_mode_silence_secs: 3.0,
+            bar_x: Some(123.5),
+            bar_y: Some(456.0),
+            bubble_recording_mode: "toggle".to_string(),
+            bubble_tap_mode: "autostop".to_string(),
+            bubble_tap_auto_send: true,
+            bubble_tap_silence_secs: 3.0,
+            bubble_long_press_mode: "hold".to_string(),
+            bubble_long_press_auto_send: false,
+            bubble_long_press_silence_secs: 1.5,
         };
 
         save_config(dir.path(), &original).expect("save should succeed");
@@ -1121,12 +1476,17 @@ mod tests {
     #[test]
     fn test_fresh_config_keeps_defaults() {
         let dir = temp_dir();
-        // Only set a key -- no priority lists.
+        // Only a Groq key is set, no priority lists, no explicit llmProvider.
+        // The default llm_provider is "deepseek", but deepseek has no key while
+        // Groq does -- so the auto-fallback switches llm_provider to "groq".
         let fresh = r#"{"groqApiKey": "gsk_test"}"#;
         std::fs::write(dir.path().join("config.json"), fresh.as_bytes()).unwrap();
         let cfg = load_config(dir.path());
         assert_eq!(cfg.stt_provider, "groq", "fresh config should keep default stt_provider");
-        assert_eq!(cfg.llm_provider, "deepseek", "fresh config should keep default llm_provider");
+        assert_eq!(
+            cfg.llm_provider, "groq",
+            "auto-fallback: deepseek has no key, groq does, so llm_provider should switch to groq"
+        );
     }
 
     /// Config that already has an explicit sttProvider is NOT overwritten by migration,
@@ -1578,6 +1938,352 @@ mod tests {
         assert!(
             json.contains("localWhisperGpu"),
             "expected camelCase 'localWhisperGpu'"
+        );
+    }
+
+    // --- bar_x / bar_y position persistence tests ---
+
+    /// Default bar_x and bar_y are None (no saved position on first run).
+    #[test]
+    fn test_default_bar_position_is_none() {
+        let cfg = AppConfig::default();
+        assert!(cfg.bar_x.is_none(), "default bar_x should be None");
+        assert!(cfg.bar_y.is_none(), "default bar_y should be None");
+    }
+
+    /// bar_x and bar_y round-trip through save/load with concrete values.
+    #[test]
+    fn test_bar_position_roundtrip() {
+        let dir = temp_dir();
+        let cfg = AppConfig {
+            bar_x: Some(320.5),
+            bar_y: Some(1024.0),
+            ..AppConfig::default()
+        };
+        save_config(dir.path(), &cfg).expect("save should succeed");
+        let loaded = load_config(dir.path());
+        assert_eq!(loaded.bar_x, Some(320.5));
+        assert_eq!(loaded.bar_y, Some(1024.0));
+    }
+
+    /// Old config.json without barX / barY loads with None defaults (backwards compat).
+    #[test]
+    fn test_old_config_without_bar_position_loads_with_none() {
+        let dir = temp_dir();
+        // Simulate a config.json written before bar_x/bar_y were added.
+        let legacy = r#"{"language": "de", "groqApiKey": "gsk_test"}"#;
+        std::fs::write(dir.path().join("config.json"), legacy.as_bytes()).unwrap();
+
+        let cfg = load_config(dir.path());
+        assert!(
+            cfg.bar_x.is_none(),
+            "bar_x should be None when field is absent in config.json"
+        );
+        assert!(
+            cfg.bar_y.is_none(),
+            "bar_y should be None when field is absent in config.json"
+        );
+    }
+
+    /// bar_x and bar_y serialize with camelCase keys.
+    #[test]
+    fn test_bar_position_serializes_camel_case() {
+        let cfg = AppConfig {
+            bar_x: Some(100.0),
+            bar_y: Some(200.0),
+            ..AppConfig::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"barX\""), "expected camelCase 'barX'");
+        assert!(json.contains("\"barY\""), "expected camelCase 'barY'");
+    }
+
+    /// `AutoStop` and `Auto` variants serialize with lowercase names.
+    #[test]
+    fn test_hotkey_mode_new_variants_serialize() {
+        let autostop = serde_json::to_string(&HotkeyMode::AutoStop).unwrap();
+        let auto = serde_json::to_string(&HotkeyMode::Auto).unwrap();
+        assert_eq!(autostop, r#""autostop""#);
+        assert_eq!(auto, r#""auto""#);
+    }
+
+    /// `AutoStop` and `Auto` variants deserialize from lowercase strings.
+    #[test]
+    fn test_hotkey_mode_new_variants_deserialize() {
+        let autostop: HotkeyMode = serde_json::from_str(r#""autostop""#).unwrap();
+        let auto: HotkeyMode = serde_json::from_str(r#""auto""#).unwrap();
+        assert_eq!(autostop, HotkeyMode::AutoStop);
+        assert_eq!(auto, HotkeyMode::Auto);
+    }
+
+    /// All four `HotkeyMode` variants survive a save/load round-trip.
+    #[test]
+    fn test_all_hotkey_modes_roundtrip() {
+        for mode in [HotkeyMode::Toggle, HotkeyMode::Hold, HotkeyMode::AutoStop, HotkeyMode::Auto] {
+            let dir = temp_dir();
+            let cfg = AppConfig { hotkey_mode: mode, ..AppConfig::default() };
+            save_config(dir.path(), &cfg).unwrap();
+            let loaded = load_config(dir.path());
+            assert_eq!(loaded.hotkey_mode, mode, "mode {mode:?} should survive roundtrip");
+        }
+    }
+
+    /// Default values for new recording-mode config fields are correct.
+    #[test]
+    fn test_new_recording_mode_defaults() {
+        let cfg = AppConfig::default();
+        assert!(!cfg.insert_and_send, "insert_and_send should default to false");
+        assert!((cfg.autostop_silence_secs - 2.0).abs() < f32::EPSILON);
+        assert!((cfg.auto_mode_silence_secs - 2.0).abs() < f32::EPSILON);
+    }
+
+    /// New recording-mode fields survive a save/load round-trip.
+    #[test]
+    fn test_new_recording_mode_fields_roundtrip() {
+        let dir = temp_dir();
+        let cfg = AppConfig {
+            insert_and_send: true,
+            autostop_silence_secs: 1.5,
+            auto_mode_silence_secs: 3.0,
+            ..AppConfig::default()
+        };
+        save_config(dir.path(), &cfg).unwrap();
+        let loaded = load_config(dir.path());
+        // Migration: global insert_and_send=true is moved to slots, global reset to false
+        assert!(!loaded.insert_and_send, "global insert_and_send should be false after migration");
+        assert!(loaded.hotkey_slots.iter().all(|s| s.insert_and_send),
+            "all slots should have insert_and_send=true after migration");
+        assert!((loaded.autostop_silence_secs - 1.5).abs() < f32::EPSILON);
+        assert!((loaded.auto_mode_silence_secs - 3.0).abs() < f32::EPSILON);
+    }
+
+    /// Partial JSON without new fields fills in defaults (backward compat).
+    #[test]
+    fn test_new_fields_absent_from_json_use_defaults() {
+        let dir = temp_dir();
+        let partial = r#"{"language": "de"}"#;
+        std::fs::write(dir.path().join("config.json"), partial.as_bytes()).unwrap();
+        let cfg = load_config(dir.path());
+        assert!(!cfg.insert_and_send);
+        assert!((cfg.autostop_silence_secs - 2.0).abs() < f32::EPSILON);
+        assert!((cfg.auto_mode_silence_secs - 2.0).abs() < f32::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // HotkeySlot tests
+    // -----------------------------------------------------------------------
+
+    /// `HotkeySlot` serializes with camelCase keys.
+    #[test]
+    fn test_hotkey_slot_serializes_camel_case() {
+        let slot = HotkeySlot {
+            hotkey: "ctrl+shift+d".to_string(),
+            mode: HotkeyMode::Hold,
+            insert_and_send: false,
+        };
+        let json = serde_json::to_string(&slot).unwrap();
+        assert!(json.contains("\"hotkey\""), "expected key 'hotkey'");
+        assert!(json.contains("\"mode\""), "expected key 'mode'");
+        assert!(json.contains("\"hold\""), "expected mode value 'hold'");
+    }
+
+    /// `HotkeySlot` deserializes correctly from JSON.
+    #[test]
+    fn test_hotkey_slot_deserializes() {
+        let json = r#"{"hotkey":"ctrl+shift+d","mode":"toggle"}"#;
+        let slot: HotkeySlot = serde_json::from_str(json).unwrap();
+        assert_eq!(slot.hotkey, "ctrl+shift+d");
+        assert_eq!(slot.mode, HotkeyMode::Toggle);
+    }
+
+    /// `HotkeySlot` round-trips through serialize → deserialize without loss.
+    #[test]
+    fn test_hotkey_slot_roundtrip() {
+        for mode in [HotkeyMode::Toggle, HotkeyMode::Hold, HotkeyMode::AutoStop, HotkeyMode::Auto] {
+            let slot = HotkeySlot {
+                hotkey: "ctrl+shift+x".to_string(),
+                mode,
+                insert_and_send: false,
+            };
+            let json = serde_json::to_string(&slot).unwrap();
+            let back: HotkeySlot = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, slot, "HotkeySlot with mode {mode:?} should survive roundtrip");
+        }
+    }
+
+    /// `HotkeySlot::is_enabled` returns `true` for non-empty hotkeys and `false` for empty.
+    #[test]
+    fn test_hotkey_slot_is_enabled() {
+        let enabled = HotkeySlot { hotkey: "ctrl+shift+d".to_string(), mode: HotkeyMode::Hold, insert_and_send: false };
+        let disabled = HotkeySlot { hotkey: String::new(), mode: HotkeyMode::Hold, insert_and_send: false };
+        assert!(enabled.is_enabled());
+        assert!(!disabled.is_enabled());
+    }
+
+    // -----------------------------------------------------------------------
+    // hotkey_slots default / migration / roundtrip
+    // -----------------------------------------------------------------------
+
+    /// Default config has exactly 2 slots: slot 0 enabled, slot 1 disabled.
+    #[test]
+    fn test_default_hotkey_slots() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.hotkey_slots.len(), 2, "default should have exactly 2 slots");
+        assert_eq!(cfg.hotkey_slots[0].hotkey, "ctrl+shift+d");
+        assert_eq!(cfg.hotkey_slots[0].mode, HotkeyMode::Hold);
+        assert!(cfg.hotkey_slots[1].hotkey.is_empty(), "slot 1 should be disabled by default");
+    }
+
+    /// `hotkey_slots` round-trips through save/load without data loss.
+    #[test]
+    fn test_hotkey_slots_roundtrip() {
+        let dir = temp_dir();
+        let cfg = AppConfig {
+            hotkey_slots: vec![
+                HotkeySlot { hotkey: "ctrl+shift+d".to_string(), mode: HotkeyMode::Toggle, insert_and_send: false },
+                HotkeySlot { hotkey: "ctrl+shift+f".to_string(), mode: HotkeyMode::AutoStop, insert_and_send: false },
+            ],
+            ..AppConfig::default()
+        };
+        save_config(dir.path(), &cfg).expect("save should succeed");
+        let loaded = load_config(dir.path());
+        assert_eq!(loaded.hotkey_slots, cfg.hotkey_slots);
+    }
+
+    /// Migration: old config with only `hotkey` + `hotkey_mode`, no `hotkey_slots`.
+    /// Slot 0 must be populated from the legacy fields; slot 1 must be disabled.
+    #[test]
+    fn test_migration_legacy_hotkey_fields_to_slots() {
+        let dir = temp_dir();
+        let legacy = r#"{"hotkey":"ctrl+alt+r","hotkeyMode":"toggle"}"#;
+        std::fs::write(dir.path().join("config.json"), legacy.as_bytes()).unwrap();
+
+        let cfg = load_config(dir.path());
+
+        assert_eq!(cfg.hotkey_slots.len(), 2, "migration should produce exactly 2 slots");
+        assert_eq!(cfg.hotkey_slots[0].hotkey, "ctrl+alt+r", "slot 0 hotkey must come from legacy field");
+        assert_eq!(cfg.hotkey_slots[0].mode, HotkeyMode::Toggle, "slot 0 mode must come from legacy field");
+        assert!(cfg.hotkey_slots[1].hotkey.is_empty(), "slot 1 must be disabled after migration");
+        assert_eq!(cfg.hotkey_slots[1].mode, HotkeyMode::Hold);
+    }
+
+    /// Migration: old config with neither `hotkey_slots` nor legacy fields.
+    /// Slot 0 must fall back to the compiled-in defaults.
+    #[test]
+    fn test_migration_empty_config_uses_defaults_for_slot0() {
+        let dir = temp_dir();
+        let empty = r#"{}"#;
+        std::fs::write(dir.path().join("config.json"), empty.as_bytes()).unwrap();
+
+        let cfg = load_config(dir.path());
+
+        assert_eq!(cfg.hotkey_slots.len(), 2);
+        assert_eq!(cfg.hotkey_slots[0].hotkey, "ctrl+shift+d", "slot 0 should fall back to default hotkey");
+        assert_eq!(cfg.hotkey_slots[0].mode, HotkeyMode::Hold, "slot 0 should fall back to Hold mode");
+        assert!(cfg.hotkey_slots[1].hotkey.is_empty());
+    }
+
+    /// Migration is persisted: a second load_config call reads the already-migrated
+    /// on-disk file and does NOT re-run the migration.
+    #[test]
+    fn test_hotkey_slots_migration_is_persisted() {
+        let dir = temp_dir();
+        let legacy = r#"{"hotkey":"ctrl+alt+r","hotkeyMode":"toggle"}"#;
+        std::fs::write(dir.path().join("config.json"), legacy.as_bytes()).unwrap();
+
+        // First load triggers migration + save.
+        let _ = load_config(dir.path());
+
+        // Second load reads the already-migrated file.
+        let cfg2 = load_config(dir.path());
+        assert_eq!(cfg2.hotkey_slots.len(), 2);
+        assert_eq!(cfg2.hotkey_slots[0].hotkey, "ctrl+alt+r");
+        assert_eq!(cfg2.hotkey_slots[0].mode, HotkeyMode::Toggle);
+    }
+
+    /// New config already containing `hotkey_slots` is NOT overwritten by migration.
+    #[test]
+    fn test_existing_hotkey_slots_suppresses_migration() {
+        let dir = temp_dir();
+        // Config already has hotkey_slots -- migration must leave them untouched.
+        let modern = r#"{
+            "hotkey": "ctrl+alt+r",
+            "hotkeyMode": "toggle",
+            "hotkeySlots": [
+                {"hotkey": "ctrl+shift+d", "mode": "hold"},
+                {"hotkey": "ctrl+shift+f", "mode": "autostop"}
+            ]
+        }"#;
+        std::fs::write(dir.path().join("config.json"), modern.as_bytes()).unwrap();
+
+        let cfg = load_config(dir.path());
+
+        // hotkey_slots must be exactly what was in the JSON, not replaced by legacy fields.
+        assert_eq!(cfg.hotkey_slots.len(), 2);
+        assert_eq!(cfg.hotkey_slots[0].hotkey, "ctrl+shift+d");
+        assert_eq!(cfg.hotkey_slots[0].mode, HotkeyMode::Hold);
+        assert_eq!(cfg.hotkey_slots[1].hotkey, "ctrl+shift+f");
+        assert_eq!(cfg.hotkey_slots[1].mode, HotkeyMode::AutoStop);
+    }
+
+    /// `hotkey_slots` serializes as camelCase `"hotkeySlots"` in JSON.
+    #[test]
+    fn test_hotkey_slots_serializes_camel_case() {
+        let cfg = AppConfig::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("hotkeySlots"), "expected camelCase 'hotkeySlots'");
+    }
+
+    // -----------------------------------------------------------------------
+    // Auto-fallback for llm_provider when the configured provider has no key
+    // -----------------------------------------------------------------------
+
+    /// llm_provider is "deepseek" (default) but deepseek key is empty while
+    /// openai key is present → auto-switch to "openai".
+    #[test]
+    fn test_llm_provider_auto_fallback_to_openai() {
+        let dir = temp_dir();
+        let json = r#"{
+            "llmProvider": "deepseek",
+            "deepseekApiKey": "",
+            "openaiApiKey": "sk-openai-test-key"
+        }"#;
+        std::fs::write(dir.path().join("config.json"), json.as_bytes()).unwrap();
+        let cfg = load_config(dir.path());
+        assert_eq!(
+            cfg.llm_provider, "openai",
+            "should auto-switch away from deepseek when its key is empty and openai has a key"
+        );
+    }
+
+    /// llm_provider is "deepseek" and deepseekApiKey is non-empty → no switch.
+    #[test]
+    fn test_llm_provider_no_switch_when_key_present() {
+        let dir = temp_dir();
+        let json = r#"{
+            "llmProvider": "deepseek",
+            "deepseekApiKey": "ds-real-key-abc",
+            "openaiApiKey": "sk-openai-test-key"
+        }"#;
+        std::fs::write(dir.path().join("config.json"), json.as_bytes()).unwrap();
+        let cfg = load_config(dir.path());
+        assert_eq!(
+            cfg.llm_provider, "deepseek",
+            "should NOT switch when the chosen provider already has a key"
+        );
+    }
+
+    /// All API keys empty → llm_provider stays at default, no panic.
+    #[test]
+    fn test_llm_provider_no_switch_when_all_keys_empty() {
+        let dir = temp_dir();
+        // No keys at all; serde fills everything with defaults.
+        let json = r#"{"language": "de"}"#;
+        std::fs::write(dir.path().join("config.json"), json.as_bytes()).unwrap();
+        let cfg = load_config(dir.path());
+        assert_eq!(
+            cfg.llm_provider, "deepseek",
+            "should stay at default when every provider key is empty"
         );
     }
 }

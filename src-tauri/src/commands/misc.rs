@@ -102,6 +102,7 @@ pub async fn paste_snippet(state: State<'_, AppState>, content: String) -> Resul
     paste_handler
         .paste(&content)
         .map_err(|e| format!("Failed to paste snippet: {e}"))
+        .map(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +167,41 @@ pub async fn sync_history(state: State<'_, AppState>) -> Result<(u32, u32), Stri
 }
 
 // ---------------------------------------------------------------------------
+// Bar position persistence
+// ---------------------------------------------------------------------------
+
+/// Persists the floating bar window position (logical pixels) to config.
+///
+/// Called by the frontend after the user drags the bar to a new position.
+/// Both `x` and `y` are always saved together -- a partial update is not
+/// supported because a single coordinate is not useful on its own.
+#[tauri::command]
+pub fn save_bar_position(state: State<'_, AppState>, x: f64, y: f64) -> Result<(), String> {
+    let inner = state.inner();
+    let mut cfg = crate::lock!(inner.config)?;
+    cfg.bar_x = Some(x);
+    cfg.bar_y = Some(y);
+    let cfg_clone = cfg.clone();
+    drop(cfg);
+    save_config(&inner.app_data_dir, &cfg_clone)
+        .map_err(|e| format!("Failed to persist bar position: {e}"))
+}
+
+/// Returns the last saved floating bar position, or `None` if no position
+/// has been saved yet (first run or after a config reset).
+///
+/// The frontend uses this to restore the bar to its previous position on
+/// startup instead of the default center-bottom placement.
+#[tauri::command]
+pub fn get_bar_position(state: State<'_, AppState>) -> Result<Option<(f64, f64)>, String> {
+    let cfg = crate::lock!(state.inner().config)?;
+    Ok(match (cfg.bar_x, cfg.bar_y) {
+        (Some(x), Some(y)) => Some((x, y)),
+        _ => None,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Window / UI helpers
 // ---------------------------------------------------------------------------
 
@@ -185,8 +221,8 @@ pub fn set_bar_shape(handle: AppHandle, shape: String) -> Result<(), String> {
                     let ht = (10.0 * scale) as i32;
                     crate::set_window_region_pill(h, w, ht);
                 } else {
-                    let w = (164.0 * scale) as i32;
-                    let ht = (18.0 * scale) as i32;
+                    let w = (200.0 * scale) as i32;
+                    let ht = (36.0 * scale) as i32;
                     crate::set_window_region_pill(h, w, ht);
                 }
             }
