@@ -1,6 +1,6 @@
 [package]
 name = "dikta"
-version = "0.4.6"
+version = "0.4.7"
 description = "Free voice dictation with AI text cleanup"
 authors = ["Andy"]
 edition = "2021"
@@ -39,6 +39,7 @@ tauri-plugin-global-shortcut = "2"
 tauri-plugin-updater = "2"
 cpal = "0.15"
 arboard = "3"
+voice_activity_detector = "0.2.1"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
@@ -59,3 +60,4 @@ version = "0.15.1"
 
 [dev-dependencies]
 tempfile = "3"
+insta = "1"

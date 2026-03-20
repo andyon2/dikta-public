@@ -18,7 +18,7 @@ const MODEL_LABELS: Record<string, string> = {
   "large-v3": "large-v3 (3.1 GB)",
 };
 
-// Models that require a paid license (small is free).
+// Only small is free. medium and large-v3 require a paid license.
 const PAID_MODELS = new Set(["medium", "large-v3"]);
 
 interface DownloadState {

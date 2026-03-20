@@ -106,7 +106,51 @@ pub fn resolve_cleanup_provider(cfg: &AppConfig) -> Arc<dyn CleanupProvider> {
 }
 
 // ---------------------------------------------------------------------------
-// Whisper hallucination detection
+// Whisper hallucination blocklist
+// ---------------------------------------------------------------------------
+
+/// Known Whisper hallucination phrases from training data artifacts.
+/// These appear when Whisper processes silence or non-speech audio.
+const HALLUCINATION_BLOCKLIST: &[&str] = &[
+    "zdf",
+    "wdr",
+    "untertitel der dctp",
+    "untertitelung des zdf",
+    "copyright wdr",
+    "vielen dank für ihre aufmerksamkeit",
+    "vielen dank fuer ihre aufmerksamkeit",
+    "untertitel im auftrag",
+    "thank you for watching",
+    "thanks for watching",
+    "please subscribe",
+    "subtitles by",
+    "amara.org",
+    "sous-titres",
+    "sottotitoli",
+    "napisy pobrano",
+];
+
+/// Returns true if the text is likely a Whisper hallucination from training
+/// data artifacts.
+///
+/// Only blocks SHORT texts (≤ 8 words after trimming) that contain a blocklist
+/// phrase. Longer texts with a blocklist phrase embedded are real speech and
+/// pass through unchanged.
+fn is_hallucination(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true; // empty text is not useful
+    }
+    let word_count = trimmed.split_whitespace().count();
+    if word_count > 8 {
+        return false; // real speech, even if it mentions "ZDF"
+    }
+    let lower = trimmed.to_lowercase();
+    HALLUCINATION_BLOCKLIST.iter().any(|phrase| lower.contains(phrase))
+}
+
+// ---------------------------------------------------------------------------
+// Whisper prompt-echo detection
 // ---------------------------------------------------------------------------
 
 /// Detects when Whisper echoes the conditioning prompt instead of real speech.
@@ -852,6 +896,15 @@ pub async fn stop_and_process_pipeline(handle: AppHandle) {
         log::info!(
             "[pipeline] transcription is prompt echo (hallucination), skipping: {raw_text:?}"
         );
+        let _ = handle.emit(EVENT_STATE_CHANGED, PipelineEvent::idle());
+        return;
+    }
+
+    // --- Blocklist guard ---
+    // Filter known Whisper training-data hallucinations (e.g. "ZDF 2020",
+    // "Thank you for watching") that slip through the prompt-echo check.
+    if is_hallucination(&raw_text) {
+        log::info!("[pipeline] Blocked Whisper hallucination: {:?}", raw_text);
         let _ = handle.emit(EVENT_STATE_CHANGED, PipelineEvent::idle());
         return;
     }
@@ -2005,6 +2058,192 @@ mod tests {
         assert!(
             result.contains("Patient presented with chest pain") && result.contains("Vitals are stable"),
             "real medical content must be preserved; got: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Characterization tests for compute_wav_rms
+    //
+    // Golden Master for the WAV-level RMS check used in stop_and_process_pipeline
+    // to detect whether the recording contains audible speech.
+    // -----------------------------------------------------------------------
+
+    /// Builds a minimal 16kHz mono 16-bit PCM WAV buffer from f32 samples.
+    ///
+    /// Replicates the encoding path used in production (`encode_to_wav`) so
+    /// the tests are independent of the audio module.
+    fn make_wav(samples: &[f32]) -> Vec<u8> {
+        use std::io::Cursor;
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut cursor = Cursor::new(Vec::new());
+        let mut writer = hound::WavWriter::new(&mut cursor, spec).unwrap();
+        for &s in samples {
+            let int_sample = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+            writer.write_sample(int_sample).unwrap();
+        }
+        writer.finalize().unwrap();
+        cursor.into_inner()
+    }
+
+    /// compute_wav_rms of a silence WAV must return Some(0.0).
+    ///
+    /// A silence WAV (all i16 zeros) round-trips through int normalisation and
+    /// should produce exactly 0.0 -- not None, not a small epsilon.
+    #[test]
+    fn characterize_compute_wav_rms_silence_is_zero() {
+        let wav = make_wav(&vec![0.0f32; 1600]); // 100 ms of silence
+        let rms = compute_wav_rms(&wav);
+        assert!(rms.is_some(), "compute_wav_rms must return Some(...) for a valid WAV");
+        let rms = rms.unwrap();
+        assert_eq!(rms, 0.0, "silence WAV must produce RMS = 0.0, got {rms}");
+    }
+
+    /// compute_wav_rms of a sine-tone WAV must be approximately 1/sqrt(2).
+    ///
+    /// We use a 440 Hz sine at full scale (amplitude 1.0).  The i16 quantisation
+    /// introduces a tiny error, so we use a loose 1e-3 tolerance.
+    #[test]
+    fn characterize_compute_wav_rms_sine_tone_snapshot() {
+        let n = 16_000usize;
+        let freq = 440.0f32;
+        let sr = 16_000.0f32;
+        let samples: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / sr).sin())
+            .collect();
+
+        let wav = make_wav(&samples);
+        let rms = compute_wav_rms(&wav).expect("sine WAV must parse successfully");
+
+        let expected = 1.0_f32 / 2.0_f32.sqrt(); // ≈ 0.70710678
+        assert!(
+            (rms - expected).abs() < 1e-3,
+            "sine-tone WAV RMS should be ≈{expected:.5}, got {rms:.5}"
+        );
+
+        // Snapshot: locks in the concrete value so any change to the i16
+        // quantisation or normalisation path is immediately visible.
+        insta::assert_debug_snapshot!("compute_wav_rms_sine_tone", rms);
+    }
+
+    /// compute_wav_rms of an invalid byte slice returns None.
+    #[test]
+    fn characterize_compute_wav_rms_invalid_bytes_returns_none() {
+        let garbage: &[u8] = b"this is not a WAV file at all!";
+        let result = compute_wav_rms(garbage);
+        assert!(result.is_none(), "invalid WAV bytes must return None, got {result:?}");
+    }
+
+    /// compute_wav_rms of an empty byte slice returns None.
+    #[test]
+    fn characterize_compute_wav_rms_empty_bytes_returns_none() {
+        let result = compute_wav_rms(&[]);
+        assert!(result.is_none(), "empty byte slice must return None");
+    }
+
+    /// compute_wav_rms is above threshold for a typical speech-level signal.
+    ///
+    /// In production, the silence threshold is 0.005.  A signal with amplitude
+    /// 0.3 (typical speech level in a dictation recording) must produce an RMS
+    /// well above that threshold.
+    #[test]
+    fn characterize_compute_wav_rms_speech_level_above_default_threshold() {
+        // Constant 0.3 amplitude -- RMS = 0.3.
+        let samples = vec![0.3f32; 3200]; // 200 ms
+        let wav = make_wav(&samples);
+        let rms = compute_wav_rms(&wav).expect("speech-level WAV must parse");
+
+        let default_threshold = 0.005_f32;
+        assert!(
+            rms > default_threshold,
+            "speech-level RMS ({rms:.4}) must exceed default silence threshold ({default_threshold})"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Hallucination blocklist tests
+    // -----------------------------------------------------------------------
+
+    /// Known hallucinations are blocked.
+    #[test]
+    fn test_hallucination_blocklist_known_phrases() {
+        assert!(
+            super::is_hallucination("ZDF 2020"),
+            "\"ZDF 2020\" must be blocked"
+        );
+        assert!(
+            super::is_hallucination("Copyright WDR"),
+            "\"Copyright WDR\" must be blocked"
+        );
+        assert!(
+            super::is_hallucination("Thank you for watching"),
+            "\"Thank you for watching\" must be blocked"
+        );
+        assert!(
+            super::is_hallucination("Untertitel im Auftrag des ZDF"),
+            "\"Untertitel im Auftrag des ZDF\" must be blocked"
+        );
+    }
+
+    /// Empty string is blocked (empty text is not useful output).
+    #[test]
+    fn test_hallucination_blocklist_empty_string() {
+        assert!(
+            super::is_hallucination(""),
+            "empty string must be blocked"
+        );
+    }
+
+    /// Real speech with >8 words passes through even if it contains a blocklist word.
+    #[test]
+    fn test_hallucination_blocklist_long_text_passes_through() {
+        let long = "Ich habe heute beim ZDF angerufen und mit dem Redakteur gesprochen über das neue Projekt";
+        assert!(
+            !super::is_hallucination(long),
+            "long real-speech text mentioning ZDF must not be blocked"
+        );
+    }
+
+    /// Normal dictation without any blocklist match passes through.
+    #[test]
+    fn test_hallucination_blocklist_real_speech_not_blocked() {
+        assert!(
+            !super::is_hallucination("Bitte schick mir die Datei"),
+            "\"Bitte schick mir die Datei\" must not be blocked"
+        );
+        assert!(
+            !super::is_hallucination("Das Meeting ist um 14 Uhr"),
+            "\"Das Meeting ist um 14 Uhr\" must not be blocked"
+        );
+    }
+
+    /// Leading/trailing whitespace is ignored -- the phrase is still blocked.
+    #[test]
+    fn test_hallucination_blocklist_whitespace_trimmed() {
+        assert!(
+            super::is_hallucination("  ZDF  "),
+            "\"  ZDF  \" with surrounding whitespace must be blocked"
+        );
+    }
+
+    /// Matching is case-insensitive.
+    #[test]
+    fn test_hallucination_blocklist_case_insensitive() {
+        assert!(
+            super::is_hallucination("zdf"),
+            "lowercase \"zdf\" must be blocked"
+        );
+        assert!(
+            super::is_hallucination("ZDF"),
+            "uppercase \"ZDF\" must be blocked"
+        );
+        assert!(
+            super::is_hallucination("Zdf"),
+            "mixed-case \"Zdf\" must be blocked"
         );
     }
 }

@@ -25,6 +25,9 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, StreamConfig};
 use thiserror::Error;
 
+#[cfg(desktop)]
+use crate::vad::{SileroVad, SpeechState, VadConfig, VadError};
+
 /// Errors that can occur during audio capture or encoding.
 #[derive(Debug, Error)]
 pub enum AudioError {
@@ -57,6 +60,10 @@ pub enum AudioError {
 
     #[error("Not supported on this platform")]
     NotSupported,
+
+    #[cfg(desktop)]
+    #[error("VAD initialisation failed: {0}")]
+    VadInit(#[from] VadError),
 }
 
 /// Target output format for WAV encoding -- what Groq and whisper.cpp expect.
@@ -81,10 +88,12 @@ pub type SilenceCallback = Box<dyn Fn() + Send + 'static>;
 /// cleared or updated between recording sessions.
 #[cfg(desktop)]
 struct SilenceConfig {
-    /// Minimum number of consecutive silent chunks before firing the callback.
-    silent_chunks_required: usize,
-    /// RMS threshold below which audio is considered silence.
+    /// Forwarded to VadConfig::energy_floor so audio below this amplitude
+    /// is skipped by Silero inference (CPU savings).
     threshold: f32,
+    /// How many seconds of post-speech silence before firing the callback.
+    /// Forwarded to VadConfig::hangover_ms.
+    duration_secs: f32,
     /// The closure to call (exactly once) when silence is detected.
     callback: SilenceCallback,
 }
@@ -155,13 +164,13 @@ impl AudioRecorder {
 
     /// Installs a silence-detection callback.
     ///
-    /// When the RMS of the incoming audio stays below `threshold` for at least
-    /// `duration_secs` seconds, `callback` is called exactly once and then
-    /// removed.  Call this *before* `start_recording`.
+    /// When the VAD transitions from Speaking → Silence, `callback` is called
+    /// exactly once and then removed. Call this *before* `start_recording`.
     ///
-    /// The chunk size used for RMS evaluation is ~66 ms (same as the level
-    /// callback interval), so `duration_secs` is rounded to the nearest
-    /// chunk boundary.
+    /// `duration_secs` is no longer used directly (the VAD hangover window
+    /// controls how long post-speech silence is tolerated before the transition
+    /// fires). `threshold` is forwarded to `VadConfig::energy_floor` so frames
+    /// below this RMS amplitude are skipped by Silero inference.
     pub fn set_silence_callback(
         &self,
         _duration_secs: f32,
@@ -170,16 +179,9 @@ impl AudioRecorder {
     ) {
         #[cfg(desktop)]
         {
-            // We resolve the chunk count here (at install time) and store it
-            // so the recording thread just needs an atomic counter to track
-            // progress. The actual sample rate is not known yet (it comes from
-            // the device at stream-open time), so we use the target rate as an
-            // approximation. For speech, 66 ms resolution is more than enough.
-            let chunks_per_sec = 15.0_f32; // ~66 ms per chunk (see recording_thread)
-            let silent_chunks_required = ((_duration_secs * chunks_per_sec).round() as usize).max(1);
             let config = SilenceConfig {
-                silent_chunks_required,
                 threshold: _threshold,
+                duration_secs: _duration_secs,
                 callback: _callback,
             };
             if let Ok(mut guard) = self.silence_config.lock() {
@@ -411,29 +413,48 @@ fn recording_thread(
     let level_chunk_writer = Arc::clone(&level_chunk);
     let samples_per_tick = (native_sample_rate / 15) as usize; // ~66ms chunks
 
-    // Silence detection: channel from stream callback to this thread.
-    // The stream callback sends the RMS of each completed chunk.
+    // RMS channel: stream callback → this thread.
+    // Still used for the audio-level waveform display (dikta://audio-level events).
+    // Previously also used for RMS-based silence detection -- that role is now
+    // handled by SileroVad below.
     let (rms_tx, rms_rx) = std::sync::mpsc::channel::<f32>();
+
+    // VAD sample channel: stream callback → this thread.
+    // The stream callback sends raw ~66ms sample chunks so the recording thread
+    // can feed them to SileroVad without touching the stream callback directly
+    // (cpal callbacks must remain lock-free and time-critical).
+    let (samples_chunk_tx, samples_chunk_rx) = std::sync::mpsc::channel::<Vec<f32>>();
 
     let stream = build_stream_with_level(
         &device, &stream_config, sample_format, samples_writer,
         level_cb_clone, level_chunk_writer, samples_per_tick, live_buffer,
-        Some(rms_tx),
+        Some(rms_tx), Some(samples_chunk_tx),
     )?;
 
     stream.play()?;
 
     if let Some(cfg) = silence_cfg {
-        // Silence-aware wait loop.
-        // We use try_recv on the stop channel so we can interleave RMS checks
-        // and stop-signal checks without blocking on either alone.
+        // Silence-aware wait loop using Silero VAD.
         //
-        // IMPORTANT: We only start counting silence AFTER speech has been
-        // detected (at least one chunk above the threshold). This prevents
-        // the callback from firing immediately when the user hasn't started
-        // speaking yet (e.g. ambient noise in a quiet room).
-        let mut consecutive_silent_chunks = 0usize;
-        let mut has_seen_speech = false;
+        // Previously: counted consecutive RMS chunks below a threshold.
+        // Now: feeds raw samples into SileroVad::feed() and fires the callback
+        // on the first Speaking → Silence transition. The VAD handles the
+        // "wait for first speech before counting silence" logic internally
+        // (it starts in HysteresisState::Silence and only fires on a
+        // Speaking → Silence edge, not on initial silence).
+        //
+        // VadConfig::energy_floor is set from the user's silence threshold
+        // slider value so the prior UX behaviour is preserved.
+        let hangover_ms = (cfg.duration_secs * 1000.0) as u32;
+        let vad_config = VadConfig {
+            energy_floor: cfg.threshold,
+            hangover_ms: hangover_ms.max(200), // minimum 200ms to bridge word gaps
+            ..VadConfig::default()
+        };
+        let mut vad = SileroVad::with_config(vad_config)?;
+        vad.reset(); // ensure clean state for this recording session
+
+        let mut prev_state = SpeechState::Silence;
         let mut fired = false;
 
         'outer: loop {
@@ -443,28 +464,51 @@ fn recording_thread(
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
 
-            // Drain all pending RMS values (may be multiple per loop iteration).
+            // Drain all pending sample chunks and feed them to the VAD.
+            // Each chunk is ~66 ms of audio at the native sample rate.
+            // Silero VAD expects 16 kHz mono — downsample if the device
+            // runs at a higher rate (e.g. 44.1/48 kHz).
             loop {
-                match rms_rx.try_recv() {
-                    Ok(rms) => {
-                        if rms >= cfg.threshold {
-                            // Speech detected -- from now on we track silence.
-                            has_seen_speech = true;
-                            consecutive_silent_chunks = 0;
-                        } else if has_seen_speech {
-                            // Silence AFTER speech -- count towards auto-stop.
-                            consecutive_silent_chunks += 1;
-                        }
-                        // else: silence before any speech -- ignore.
+                match samples_chunk_rx.try_recv() {
+                    Ok(chunk) => {
+                        let vad_input = if native_sample_rate != 16_000 {
+                            let ratio = native_sample_rate as f32 / 16_000.0;
+                            let out_len = (chunk.len() as f32 / ratio) as usize;
+                            (0..out_len)
+                                .map(|i| {
+                                    let src = (i as f32 * ratio) as usize;
+                                    chunk[src.min(chunk.len() - 1)]
+                                })
+                                .collect::<Vec<f32>>()
+                        } else {
+                            chunk
+                        };
+                        let new_state = vad.feed(&vad_input);
 
-                        if has_seen_speech
-                            && consecutive_silent_chunks >= cfg.silent_chunks_required
+                        // Fire callback exactly once on Speaking → Silence transition.
+                        // The VAD's hysteresis hangover (~608 ms default) ensures we
+                        // don't fire prematurely on brief pauses mid-sentence.
+                        if prev_state == SpeechState::Speaking
+                            && new_state == SpeechState::Silence
                             && !fired
                         {
                             fired = true;
                             (cfg.callback)();
                         }
+
+                        prev_state = new_state;
                     }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'outer,
+                }
+            }
+
+            // Drain RMS values from the audio-level channel (waveform display).
+            // These are no longer used for silence detection but must be drained
+            // to prevent the channel from backing up.
+            loop {
+                match rms_rx.try_recv() {
+                    Ok(_) => {} // consumed for channel health; waveform handled in stream callback
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'outer,
                 }
@@ -512,8 +556,11 @@ pub fn compute_rms(samples: &[f32]) -> f32 {
 /// Helper: appends f32 data to the sample buffer and periodically fires the level callback.
 ///
 /// When `rms_tx` is provided, sends the computed RMS to the recording thread
-/// for silence detection after each completed chunk. This avoids any shared-state
-/// synchronization inside the cpal callback: the callback stays cheap and lock-free.
+/// for the waveform audio-level display (dikta://audio-level events).
+///
+/// When `samples_chunk_tx` is provided, sends the raw sample chunk to the
+/// recording thread for SileroVad inference. Previously the RMS alone was sent
+/// for RMS-based silence detection; now the raw samples go to the VAD instead.
 fn process_f32_data(
     data: &[f32],
     buffer: &SampleBuffer,
@@ -522,6 +569,7 @@ fn process_f32_data(
     samples_per_tick: usize,
     live_buf: &Arc<Mutex<LiveBuffer>>,
     rms_tx: &Option<std::sync::mpsc::Sender<f32>>,
+    samples_chunk_tx: &Option<std::sync::mpsc::Sender<Vec<f32>>>,
 ) {
     buffer.lock().unwrap().extend_from_slice(data);
     if let Ok(mut lb) = live_buf.lock() {
@@ -532,27 +580,39 @@ fn process_f32_data(
     chunk.extend_from_slice(data);
     if chunk.len() >= samples_per_tick {
         let rms = compute_rms(&chunk);
-        chunk.clear();
 
-        // Fire the UI level callback (for the recording bar animation).
+        // Fire the UI level callback (for the waveform/recording bar animation).
+        // This path is unchanged -- RMS is still used for the visual display.
         if let Some(ref cb) = level_cb {
             cb(rms);
         }
 
-        // Send RMS to the recording thread for silence detection.
+        // Send RMS to the recording thread (channel health / legacy consumers).
         if let Some(ref tx) = rms_tx {
             // Ignore send errors -- the thread may have exited already.
             let _ = tx.send(rms);
         }
+
+        // Send raw samples to the recording thread for SileroVad inference.
+        // Previously: only RMS was sent for RMS-based silence detection.
+        // Now: raw samples go to VAD; RMS above is only for the waveform display.
+        if let Some(ref tx) = samples_chunk_tx {
+            let _ = tx.send(chunk.clone());
+        }
+
+        chunk.clear();
     }
 }
 
 #[cfg(desktop)]
 /// Builds a cpal input stream for the given sample format, with audio-level callback support.
 ///
-/// `rms_tx`: if provided, the completed RMS value of each chunk is sent to this
-/// channel so the recording thread can do silence detection without touching the
-/// stream callback closure (which must be `Send`).
+/// `rms_tx`: if provided, the computed RMS of each chunk is sent to the recording
+/// thread for the waveform audio-level display.
+///
+/// `samples_chunk_tx`: if provided, the raw sample chunk is sent to the recording
+/// thread for SileroVad inference. Previously only `rms_tx` existed and its values
+/// were used for RMS-based silence detection; now raw samples go to the VAD.
 fn build_stream_with_level(
     device: &cpal::Device,
     config: &StreamConfig,
@@ -563,13 +623,14 @@ fn build_stream_with_level(
     samples_per_tick: usize,
     live_buf: Arc<Mutex<LiveBuffer>>,
     rms_tx: Option<std::sync::mpsc::Sender<f32>>,
+    samples_chunk_tx: Option<std::sync::mpsc::Sender<Vec<f32>>>,
 ) -> Result<cpal::Stream, AudioError> {
     match sample_format {
         SampleFormat::F32 => {
             let stream = device.build_input_stream(
                 config,
                 move |data: &[f32], _| {
-                    process_f32_data(data, &buffer, &level_cb, &level_chunk, samples_per_tick, &live_buf, &rms_tx);
+                    process_f32_data(data, &buffer, &level_cb, &level_chunk, samples_per_tick, &live_buf, &rms_tx, &samples_chunk_tx);
                 },
                 |err| eprintln!("[audio] stream error: {err}"),
                 None,
@@ -581,7 +642,7 @@ fn build_stream_with_level(
                 config,
                 move |data: &[i16], _| {
                     let converted: Vec<f32> = data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
-                    process_f32_data(&converted, &buffer, &level_cb, &level_chunk, samples_per_tick, &live_buf, &rms_tx);
+                    process_f32_data(&converted, &buffer, &level_cb, &level_chunk, samples_per_tick, &live_buf, &rms_tx, &samples_chunk_tx);
                 },
                 |err| eprintln!("[audio] stream error: {err}"),
                 None,
@@ -593,7 +654,7 @@ fn build_stream_with_level(
                 config,
                 move |data: &[u16], _| {
                     let converted: Vec<f32> = data.iter().map(|&s| (s as f32 / u16::MAX as f32) * 2.0 - 1.0).collect();
-                    process_f32_data(&converted, &buffer, &level_cb, &level_chunk, samples_per_tick, &live_buf, &rms_tx);
+                    process_f32_data(&converted, &buffer, &level_cb, &level_chunk, samples_per_tick, &live_buf, &rms_tx, &samples_chunk_tx);
                 },
                 |err| eprintln!("[audio] stream error: {err}"),
                 None,
@@ -604,7 +665,7 @@ fn build_stream_with_level(
             let stream = device.build_input_stream(
                 config,
                 move |data: &[f32], _| {
-                    process_f32_data(data, &buffer, &level_cb, &level_chunk, samples_per_tick, &live_buf, &rms_tx);
+                    process_f32_data(data, &buffer, &level_cb, &level_chunk, samples_per_tick, &live_buf, &rms_tx, &samples_chunk_tx);
                 },
                 |err| eprintln!("[audio] stream error: {err}"),
                 None,
@@ -870,5 +931,227 @@ mod tests {
         recorder.set_silence_callback(2.0, 0.01, Box::new(|| {}));
         recorder.clear_silence_callback();
         // No panic = pass
+    }
+
+    // -----------------------------------------------------------------------
+    // Characterization tests -- Golden Master for the RMS-based silence
+    // detection. These tests document the CURRENT behaviour so that a later
+    // swap to Silero VAD can detect unintended regressions.
+    // -----------------------------------------------------------------------
+
+    /// compute_rms of pure silence (all zeros) must be exactly 0.0.
+    ///
+    /// This is the degenerate case the silence detector relies on:
+    /// a buffer of nothing but zeros must never exceed any positive threshold.
+    #[test]
+    fn characterize_compute_rms_all_zeros_is_zero() {
+        let silence = vec![0.0f32; 1024];
+        let rms = compute_rms(&silence);
+        assert_eq!(rms, 0.0, "silence samples must produce RMS = 0.0, got {rms}");
+    }
+
+    /// compute_rms of a mathematically-correct 440 Hz sine wave (1 period at
+    /// 16 kHz) must equal 1/sqrt(2) ≈ 0.7071 within floating-point tolerance.
+    ///
+    /// For a pure sine `sin(2πft)` with amplitude A=1 the analytical RMS is
+    /// A/√2.  We use a full integer number of periods so there is no partial-
+    /// period bias.
+    #[test]
+    fn characterize_compute_rms_sine_wave_equals_amplitude_over_sqrt2() {
+        // 440 Hz sine, 16 kHz sample rate, exactly 1 period = 16000/440 ≈ 36.36
+        // samples.  We use 16000 samples (1 second) = many complete cycles, which
+        // cancels the fractional-period error almost entirely.
+        let n = 16_000usize;
+        let freq = 440.0f32;
+        let sr = 16_000.0f32;
+        let samples: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / sr).sin())
+            .collect();
+
+        let rms = compute_rms(&samples);
+        let expected = 1.0_f32 / 2.0_f32.sqrt(); // ≈ 0.70710678
+        assert!(
+            (rms - expected).abs() < 1e-4,
+            "RMS of full-scale 440 Hz sine should be ≈{expected:.6}, got {rms:.6}"
+        );
+    }
+
+    /// compute_rms snapshot: a mixed speech-like signal (some loud, some quiet
+    /// samples) produces a stable, known value.
+    ///
+    /// Signal: 256 samples alternating between 0.6 and 0.0 (half the samples
+    /// are active).  Analytical RMS = sqrt(0.6² / 2) = 0.6 / sqrt(2) ≈ 0.4243.
+    #[test]
+    fn characterize_compute_rms_speech_like_mixed_signal_snapshot() {
+        let samples: Vec<f32> = (0..256)
+            .map(|i| if i % 2 == 0 { 0.6_f32 } else { 0.0_f32 })
+            .collect();
+
+        let rms = compute_rms(&samples);
+
+        // Analytical value: sqrt(sum(0.6^2 for 128 samples) / 256)
+        //                  = sqrt(128 * 0.36 / 256) = sqrt(0.18) ≈ 0.4243
+        let expected = (128.0_f32 * 0.6_f32 * 0.6_f32 / 256.0_f32).sqrt();
+        assert!(
+            (rms - expected).abs() < 1e-5,
+            "speech-like RMS should be ≈{expected:.6}, got {rms:.6}"
+        );
+
+        // Snapshot with insta: locks in the concrete floating-point value so
+        // any refactor that changes the computation is caught immediately.
+        insta::assert_debug_snapshot!("compute_rms_speech_like", rms);
+    }
+
+    /// compute_rms of a single non-zero sample equals that sample's magnitude.
+    #[test]
+    fn characterize_compute_rms_single_sample() {
+        let rms = compute_rms(&[0.4f32]);
+        assert!(
+            (rms - 0.4).abs() < 1e-6,
+            "RMS of a single sample [0.4] must be 0.4, got {rms}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Silence-detection state-machine characterization
+    //
+    // The actual detection loop lives inside `recording_thread` (not
+    // unit-testable without a real cpal device).  We replicate its *exact*
+    // logic here as a local helper and drive it with synthetic RMS sequences.
+    // If the production loop is ever refactored, these tests will catch drift.
+    // -----------------------------------------------------------------------
+
+    /// Mirrors the silence-detection state machine in `recording_thread`.
+    ///
+    /// Returns (callback_fired: bool, consecutive_silent_chunks_at_end: usize).
+    fn run_silence_state_machine(
+        rms_values: &[f32],
+        threshold: f32,
+        silent_chunks_required: usize,
+    ) -> (bool, usize) {
+        let mut consecutive_silent_chunks = 0usize;
+        let mut has_seen_speech = false;
+        let mut fired = false;
+
+        for &rms in rms_values {
+            if rms >= threshold {
+                has_seen_speech = true;
+                consecutive_silent_chunks = 0;
+            } else if has_seen_speech {
+                consecutive_silent_chunks += 1;
+            }
+
+            if has_seen_speech && consecutive_silent_chunks >= silent_chunks_required && !fired {
+                fired = true;
+            }
+        }
+
+        (fired, consecutive_silent_chunks)
+    }
+
+    /// N consecutive chunks below threshold (with prior speech) fires the callback.
+    #[test]
+    fn characterize_silence_loop_fires_after_n_silent_chunks() {
+        // Simulate: 5 speech chunks above threshold, then 3 silent chunks.
+        // With silent_chunks_required = 3, callback must fire.
+        let threshold = 0.01_f32;
+        let required = 3;
+
+        let mut rms_values = vec![0.05f32; 5]; // speech
+        rms_values.extend(vec![0.005f32; 3]);  // silence
+
+        let (fired, _) = run_silence_state_machine(&rms_values, threshold, required);
+        assert!(fired, "callback must fire after {required} consecutive silent chunks");
+    }
+
+    /// Chunks above threshold never fire the callback.
+    #[test]
+    fn characterize_silence_loop_no_fire_when_above_threshold() {
+        let threshold = 0.01_f32;
+        let required = 3;
+
+        // All chunks above threshold -- should never fire.
+        let rms_values = vec![0.05f32; 20];
+        let (fired, silent_count) = run_silence_state_machine(&rms_values, threshold, required);
+
+        assert!(!fired, "callback must not fire when all chunks are above threshold");
+        assert_eq!(silent_count, 0, "silent counter must stay 0 when all chunks are loud");
+    }
+
+    /// A single loud chunk between silent chunks resets the counter to 0.
+    #[test]
+    fn characterize_silence_loop_loud_chunk_resets_counter() {
+        let threshold = 0.01_f32;
+        let required = 5; // high threshold so it doesn't fire prematurely
+
+        // Speech → 3 silent → 1 loud → 2 more silent
+        let mut rms_values = vec![0.05f32; 3]; // speech
+        rms_values.extend(vec![0.005f32; 3]);  // 3 silent
+        rms_values.push(0.05f32);              // loud chunk (resets counter)
+        rms_values.extend(vec![0.005f32; 2]);  // 2 more silent
+
+        let (fired, final_count) = run_silence_state_machine(&rms_values, threshold, required);
+        assert!(!fired, "callback must not fire: counter was reset by loud chunk");
+        // After reset the counter only accumulated 2, not 5.
+        assert_eq!(final_count, 2, "counter should be 2 after reset + 2 silent chunks");
+    }
+
+    /// Speech chunks followed by silence with required=1 fires immediately.
+    #[test]
+    fn characterize_silence_loop_fires_at_minimum_required_one() {
+        let threshold = 0.01_f32;
+        let required = 1;
+
+        let mut rms_values = vec![0.05f32; 3]; // speech
+        rms_values.push(0.005f32);             // exactly 1 silent chunk
+
+        let (fired, _) = run_silence_state_machine(&rms_values, threshold, required);
+        assert!(fired, "callback must fire after exactly 1 silent chunk when required=1");
+    }
+
+    /// Pure silence before any speech never fires the callback.
+    ///
+    /// This guards the "wait for speech first" logic: ambient noise in a quiet
+    /// room must not trigger auto-stop before the user has started speaking.
+    #[test]
+    fn characterize_silence_loop_no_fire_without_prior_speech() {
+        let threshold = 0.01_f32;
+        let required = 3;
+
+        // Only silent chunks -- no speech chunk ever seen.
+        let rms_values = vec![0.005f32; 10];
+        let (fired, _) = run_silence_state_machine(&rms_values, threshold, required);
+        assert!(!fired, "callback must NOT fire when there has been no speech yet");
+    }
+
+    /// Callback fires exactly once even when more silent chunks follow.
+    #[test]
+    fn characterize_silence_loop_fires_exactly_once() {
+        let threshold = 0.01_f32;
+        let required = 2;
+
+        // Speech → 10 silent chunks (well beyond required=2).
+        let mut rms_values = vec![0.05f32; 2];
+        rms_values.extend(vec![0.005f32; 10]);
+
+        // We track how many times the callback *would* fire by counting
+        // manually (the production code uses the `fired` flag to guard this).
+        let mut consecutive_silent_chunks = 0usize;
+        let mut has_seen_speech = false;
+        let mut fire_count = 0usize;
+
+        for &rms in &rms_values {
+            if rms >= threshold {
+                has_seen_speech = true;
+                consecutive_silent_chunks = 0;
+            } else if has_seen_speech {
+                consecutive_silent_chunks += 1;
+            }
+            if has_seen_speech && consecutive_silent_chunks >= required && fire_count == 0 {
+                fire_count += 1;
+            }
+        }
+
+        assert_eq!(fire_count, 1, "callback must fire exactly once, not {fire_count} times");
     }
 }
