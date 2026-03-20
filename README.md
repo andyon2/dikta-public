@@ -64,15 +64,41 @@ Beim ersten Start führt dich ein **Einrichtungs-Wizard** durch alles: Cloud ode
 
 ## Was Dikta kann
 
+### Einmal zahlen, für immer nutzen
+
+Kein Abo, keine monatlichen Kosten für die App selbst. Du zahlst nur die API-Nutzung deiner eigenen Keys — bei normalem Gebrauch unter 3 € im Monat. Das Kosten-Dashboard zeigt dir live, was du gegenüber Wispr Flow ($12/Monat) sparst.
+
+### Kernfunktionen
+
 <table>
 <tr><td><b>End-to-End Pipeline</b></td><td>Aufnehmen → Transkribieren → Bereinigen → Einfügen ins aktive Fenster. Ein Hotkey, ein Ergebnis.</td></tr>
 <tr><td><b>3 Schreibstile</b></td><td><b>Polished</b> (Füllwörter weg, Grammatik, Profi-Text), <b>Verbatim</b> (nur Satzzeichen), <b>Chat</b> (locker, Emojis erlaubt).</td></tr>
+<tr><td><b>Post-Diktat Reformate</b></td><td>Nach jedem Diktat: One-Click-Buttons für <b>Email</b>, <b>Aufzählung</b> oder <b>Zusammenfassung</b> — Text sofort umstrukturieren.</td></tr>
 <tr><td><b>Live-Übersetzung</b></td><td>Deutsch sprechen, Englisch einfügen — oder umgekehrt. 13 Output-Sprachen konfigurierbar.</td></tr>
-<tr><td><b>Custom Dictionary</b></td><td>Fachbegriffe die STT und LLM beibehalten sollen (Produktnamen, Abkürzungen, Eigennamen).</td></tr>
-<tr><td><b>App Profiles</b></td><td>Stil, Sprache und Prompt pro App automatisch anpassen. Slack = Chat-Stil, Word = Polished.</td></tr>
 <tr><td><b>Command Mode</b></td><td>Text selektieren, Sprachbefehl geben ("Mach das kürzer", "Übersetze auf Englisch"). Strg+Shift+E.</td></tr>
-<tr><td><b>History</b></td><td>Alle Diktate durchsuchbar, nachträglich bearbeitbar.</td></tr>
-<tr><td><b>Kosten-Dashboard</b></td><td>Zeigt STT- und LLM-Kosten pro Session. Vergleich: "Du sparst X € vs. Wispr Flow".</td></tr>
+<tr><td><b>BYOK — Bring Your Own Key</b></td><td>Deine eigenen API-Keys für Groq, DeepSeek, OpenAI oder OpenRouter. Kein Proxy, kein Vendor Lock-in. Du wählst Provider und Modell.</td></tr>
+<tr><td><b>Offline-Modus</b></td><td>Spracherkennung lokal über whisper.cpp mit GPU-Beschleunigung — keine Daten verlassen deinen Rechner. Ideal für sensible Umgebungen.</td></tr>
+</table>
+
+### Produktivitäts-Features
+
+<table>
+<tr><td><b>Dual Hotkeys</b></td><td>2 unabhängige Hotkey-Slots mit je eigenem Modus. Slot 1 = Hold für kurze Chat-Nachrichten, Slot 2 = Toggle für lange Dokumente — kein Umkonfigurieren nötig.</td></tr>
+<tr><td><b>Insert-and-Send</b></td><td>Drückt automatisch Enter nach dem Einfügen — diktierter Text wird direkt abgeschickt (z.B. in Slack, WhatsApp Web, Teams).</td></tr>
+<tr><td><b>App Profiles</b></td><td>Stil, Sprache und Prompt pro App automatisch anpassen. Slack = Chat-Stil, Word = Polished.</td></tr>
+<tr><td><b>Custom Dictionary</b></td><td>Fachbegriffe die Dikta beibehalten soll (Produktnamen, Abkürzungen, Eigennamen).</td></tr>
+<tr><td><b>Voice Notes</b></td><td>Diktate als Notizen speichern statt einzufügen — für Ideen, Memos, Gedankenprotokolle.</td></tr>
+<tr><td><b>Text Snippets</b></td><td>Häufig genutzte Textbausteine per Klick einfügen.</td></tr>
+</table>
+
+### Tracking & Integrationen
+
+<table>
+<tr><td><b>Kosten-Dashboard</b></td><td>Trackt STT- und LLM-Kosten pro Diktat. Zeigt live: "Du sparst X € vs. Wispr Flow diesen Monat".</td></tr>
+<tr><td><b>Füllwort-Analyse</b></td><td>Zeigt deine häufigsten Füllwörter — nützlich für Presenter, Coaches, alle die besser formulieren wollen.</td></tr>
+<tr><td><b>History</b></td><td>Alle Diktate gespeichert und durchsuchbar. Roher Transkript-Text jederzeit einsehbar.</td></tr>
+<tr><td><b>Cross-Device Sync</b></td><td>Diktat-History zwischen Windows und Android synchronisieren (über Turso Cloud-DB).</td></tr>
+<tr><td><b>Webhook</b></td><td>Jedes Diktat-Ergebnis automatisch an eine URL senden — für Zapier, n8n oder eigene Automationen.</td></tr>
 </table>
 
 ---
@@ -80,21 +106,24 @@ Beim ersten Start führt dich ein **Einrichtungs-Wizard** durch alles: Cloud ode
 ## Windows
 
 <table>
-<tr><td><b>Globaler Hotkey</b></td><td>2 konfigurierbare Hotkey-Slots mit je eigenem Modus: Hold (halten), Toggle (drücken/drücken), Auto-Stop und Auto (experimental).</td></tr>
-<tr><td><b>Floating Bar</b></td><td>Schwebende Leiste am Bildschirmrand — zeigt Echtzeit-Waveform während der Aufnahme, Verarbeitungsstatus und Ergebnis.</td></tr>
-<tr><td><b>System Tray</b></td><td>Schnellzugriff über das Tray-Icon. Dikta läuft im Hintergrund.</td></tr>
-<tr><td><b>Paste überall</b></td><td>Ergebnis wird automatisch per Ctrl+V ins aktive Fenster eingefügt — Browser, Editor, Chat, Terminal.</td></tr>
-<tr><td><b>Whisper Mode</b></td><td>Audio-Verstärkung für leises Diktieren (z.B. im Büro).</td></tr>
-<tr><td><b>Offline-Modus</b></td><td>Spracherkennung lokal über whisper.cpp — kein Internet nötig, keine Daten verlassen den Rechner.</td></tr>
+<tr><td><b>Dual Hotkeys</b></td><td>2 konfigurierbare Hotkey-Slots mit je eigenem Modus: Hold (halten), Toggle (drücken/drücken), AutoStop (Stille erkennen), Auto-Loop (Endlos-Diktat).</td></tr>
+<tr><td><b>Floating Bar</b></td><td>Schwebende Pill-Leiste — zeigt Echtzeit-Waveform während der Aufnahme, Verarbeitungsstatus, aktiven Modus. Frei positionierbar.</td></tr>
+<tr><td><b>Paste überall</b></td><td>Ergebnis wird automatisch ins aktive Fenster eingefügt — Browser, Editor, Chat, Terminal. Clipboard-Fallback wenn Paste fehlschlägt.</td></tr>
+<tr><td><b>Insert-and-Send</b></td><td>Optional: Enter nach Paste — diktierte Nachricht wird direkt abgeschickt. Pro Hotkey-Slot konfigurierbar.</td></tr>
+<tr><td><b>Command Mode</b></td><td>Text selektieren, Sprachbefehl geben, LLM schreibt die Selektion um. Eigener Hotkey (Strg+Shift+E).</td></tr>
+<tr><td><b>Whisper Mode</b></td><td>Audio-Verstärkung für leises Diktieren im Büro. Konfigurierbare Gain-Stufe.</td></tr>
+<tr><td><b>Offline-Modus</b></td><td>Whisper.cpp lokal mit GPU/CUDA. Modell-Manager zum Download (small/medium/large-v3). Kein Internet nötig.</td></tr>
+<tr><td><b>System Tray</b></td><td>Schnellzugriff über das Tray-Icon. Dikta läuft im Hintergrund, Autostart konfigurierbar.</td></tr>
 </table>
 
 ## Android
 
 <table>
-<tr><td><b>Floating Bubble</b></td><td>Erscheint automatisch wenn eine Texteingabe aktiv ist — nicht dauerhaft sichtbar. Tap = Aufnahme starten/stoppen, Long-Press = Push-to-Talk.</td></tr>
+<tr><td><b>Floating Bubble</b></td><td>Erscheint automatisch wenn eine Texteingabe aktiv ist. 5 animierte Zustände: Idle, Recording (Waveform), Push-to-Talk (roter Kreis), Processing (Spinner), fertig.</td></tr>
 <tr><td><b>Unter 1 Sekunde</b></td><td>Gesamter Prozess (Aufnahme → Transkription → Cleanup → Einfügen) in unter einer Sekunde.</td></tr>
+<tr><td><b>Per-Geste konfigurierbar</b></td><td>Tap und Long-Press haben jeweils eigenen Modus (Hold, Toggle, AutoStop, Auto-Loop) und eigene Silence-Dauer.</td></tr>
 <tr><td><b>Paste überall</b></td><td>Einfügen über AccessibilityService in jedes Textfeld — WhatsApp, Mail, Browser, Notizen.</td></tr>
-<tr><td><b>Per-Geste konfigurierbar</b></td><td>Tap und Long-Press haben jeweils eigenen Modus und eigene Einstellungen.</td></tr>
+<tr><td><b>Bubble anpassbar</b></td><td>Größe, Transparenz und Position frei konfigurierbar. Position wird gespeichert.</td></tr>
 </table>
 
 ---
