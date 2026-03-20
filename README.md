@@ -64,9 +64,9 @@ Beim ersten Start führt dich ein **Einrichtungs-Wizard** durch alles: Cloud ode
 
 ## Was Dikta kann
 
-### Einmal zahlen, für immer nutzen
+### Keine App-Kosten — nur deine eigenen API-Keys
 
-Kein Abo, keine monatlichen Kosten für die App selbst. Du zahlst nur die API-Nutzung deiner eigenen Keys — bei normalem Gebrauch unter 3 € im Monat. Das Kosten-Dashboard zeigt dir live, was du gegenüber Wispr Flow ($12/Monat) sparst.
+Dikta ist kostenlos. Du bringst deine eigenen API-Keys mit (Groq, DeepSeek, etc.) und zahlst nur die tatsächliche Nutzung direkt an die Provider — bei normalem Gebrauch unter 3 € im Monat. Kein Abo, kein Dikta-Server dazwischen. Das Kosten-Dashboard zeigt dir live, was du im Vergleich zu Wispr Flow ($12/Monat) sparst.
 
 ### Kernfunktionen
 
