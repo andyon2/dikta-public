@@ -18,7 +18,6 @@
 - [Was Dikta kann](#was-dikta-kann)
 - [Windows](#windows)
 - [Android](#android)
-- [Selbst bauen](#selbst-bauen)
 - [Tech-Stack](#tech-stack)
 - [Feedback](#feedback)
 
@@ -30,16 +29,16 @@
 
 Dikta funktioniert in zwei Modi — du entscheidest beim ersten Start:
 
-> **☁️ Cloud (empfohlen)** — Beste Qualität, schnellste Ergebnisse. Du brauchst zwei kostenlose API-Keys:
->
-> | Provider | Wofür | Kosten | Key holen |
-> |----------|-------|--------|-----------|
-> | **Groq** | Spracherkennung | Kostenloses Free-Tier | [console.groq.com](https://console.groq.com) |
-> | **DeepSeek** | Text-Bereinigung | ~0,001 € pro Diktat | [platform.deepseek.com](https://platform.deepseek.com) |
->
-> Deine Sprache geht direkt an Groq/DeepSeek — kein Dikta-Server dazwischen. Bei normalem Gebrauch unter 0,10 € am Tag.
+**☁️ Cloud (empfohlen)** — Beste Qualität, schnellste Ergebnisse. Du brauchst zwei API-Keys:
 
-> **🔒 Offline (nur Windows)** — Kein Account, kein API-Key, keine Daten verlassen deinen Rechner. Spracherkennung läuft lokal über whisper.cpp (~500 MB Modell-Download beim ersten Start). Text-Cleanup wird übersprungen — du bekommst den Rohtext direkt. Ideal zum Ausprobieren ohne Registrierung.
+| Provider | Wofür | Kosten | Key holen |
+|----------|-------|--------|-----------|
+| **Groq** | Spracherkennung | Kostenloses Free-Tier (mit Nutzungslimit) | [console.groq.com](https://console.groq.com) |
+| **DeepSeek** | Text-Bereinigung | ~0,001 € pro Diktat | [platform.deepseek.com](https://platform.deepseek.com) |
+
+Deine Sprache geht direkt an Groq/DeepSeek — kein Dikta-Server dazwischen. Bei normalem Gebrauch unter 0,10 € am Tag. Groq ist kostenlos nutzbar; bei intensiver Nutzung kann ein kurzes Limit greifen.
+
+**🔒 Offline (nur Windows)** — Kein Account, kein API-Key, keine Daten verlassen deinen Rechner. Spracherkennung läuft lokal über whisper.cpp (~500 MB Modell-Download beim ersten Start). Text-Cleanup wird übersprungen — du bekommst den Rohtext direkt. Ideal zum Ausprobieren ohne Registrierung.
 
 ### 2. Installieren
 
@@ -74,7 +73,7 @@ Beim ersten Start führt dich ein **Einrichtungs-Wizard** durch alles: Cloud ode
 ## Windows
 
 <table>
-<tr><td><b>Globaler Hotkey</b></td><td>2 konfigurierbare Hotkey-Slots mit je eigenem Modus: Hold (halten), Toggle (drücken/drücken), Auto-Stop ⚠, Auto ⚠</td></tr>
+<tr><td><b>Globaler Hotkey</b></td><td>2 konfigurierbare Hotkey-Slots mit je eigenem Modus: Hold (halten), Toggle (drücken/drücken), Auto-Stop und Auto (experimental).</td></tr>
 <tr><td><b>Floating Bar</b></td><td>Schwebende Leiste am Bildschirmrand — zeigt Echtzeit-Waveform während der Aufnahme, Verarbeitungsstatus und Ergebnis.</td></tr>
 <tr><td><b>System Tray</b></td><td>Schnellzugriff über das Tray-Icon. Dikta läuft im Hintergrund.</td></tr>
 <tr><td><b>Paste überall</b></td><td>Ergebnis wird automatisch per Ctrl+V ins aktive Fenster eingefügt — Browser, Editor, Chat, Terminal.</td></tr>
@@ -84,41 +83,13 @@ Beim ersten Start führt dich ein **Einrichtungs-Wizard** durch alles: Cloud ode
 ## Android
 
 <table>
-<tr><td><b>Floating Bubble</b></td><td>Schwebt über allen Apps. Tap = Aufnahme starten/stoppen, Long-Press = Push-to-Talk.</td></tr>
+<tr><td><b>Floating Bubble</b></td><td>Erscheint automatisch wenn eine Texteingabe aktiv ist — nicht dauerhaft sichtbar. Tap = Aufnahme starten/stoppen, Long-Press = Push-to-Talk.</td></tr>
 <tr><td><b>Unter 1 Sekunde</b></td><td>Gesamter Prozess (Aufnahme → Transkription → Cleanup → Einfügen) in unter einer Sekunde.</td></tr>
 <tr><td><b>Paste überall</b></td><td>Einfügen über AccessibilityService in jedes Textfeld — WhatsApp, Mail, Browser, Notizen.</td></tr>
-<tr><td><b>Per-Geste konfigurierbar</b></td><td>Tap und Long-Press haben jeweils eigenen Modus (Hold/Toggle/Auto-Stop/Auto) und eigene Silence-Duration.</td></tr>
+<tr><td><b>Per-Geste konfigurierbar</b></td><td>Tap und Long-Press haben jeweils eigenen Modus und eigene Einstellungen.</td></tr>
 </table>
 
 ---
-
-<details>
-<summary><b>Selbst bauen</b></summary>
-
-<br>
-
-**Voraussetzungen:** Node.js, Rust/Cargo, Tauri v2 CLI
-
-```bash
-# Dependencies installieren
-npm install
-
-# .env mit API-Keys anlegen (siehe .env.example)
-cp .env.example .env
-
-# Entwicklungsserver starten
-npm run tauri dev
-
-# Release-Build (Windows)
-npm run tauri build
-```
-
-**Android-Build** (aus WSL2):
-```bash
-scripts/android-build.sh
-```
-
-</details>
 
 <details>
 <summary><b>Tech-Stack</b></summary>
@@ -131,7 +102,7 @@ scripts/android-build.sh
 | Frontend | React + TypeScript + Tailwind CSS | Typsicherheit, schnelles Styling |
 | Backend | Rust | Niedrige Latenz, native OS-APIs, whisper.cpp-Integration |
 | Mobile | Tauri v2 Android + Kotlin | Floating Bubble, native Audio, AccessibilityService |
-| STT | Groq Whisper API (primär), whisper.cpp (offline) | Schnell, kostenlos / offline-fähig |
+| STT | Groq Whisper API, whisper.cpp (offline) | Schnell, kostenlos / offline-fähig |
 | Text-Cleanup | DeepSeek (primär), OpenAI, Groq (konfigurierbar) | DeepSeek ist günstigster Provider |
 | Speicherung | JSON (Config), SQLite (History, Stats) | Einfach, kein Server nötig |
 
