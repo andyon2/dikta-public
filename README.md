@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/Android-green?style=for-the-badge&logo=android" alt="Android">
 </p>
 
-**Freie Alternative zu Wispr Flow — Sprachdiktat mit KI-Text-Cleanup.** Dikta wandelt Sprache in jedem Textfeld systemweit in bereinigten Text um. Keine Zwischenschicht, kein Abo — du nutzt deine eigenen API-Keys und zahlst nur was du verbrauchst (Groq ist kostenlos).
+**Freie Alternative zu Wispr Flow — Sprachdiktat mit KI-Text-Cleanup.** Dikta wandelt Sprache in jedem Textfeld systemweit in bereinigten Text um. Kein Abo, keine Cloud-Abhängigkeit — du entscheidest ob Cloud oder komplett offline.
 
 ## Inhaltsverzeichnis
 
@@ -18,7 +18,6 @@
 - [Was Dikta kann](#was-dikta-kann)
 - [Windows](#windows)
 - [Android](#android)
-- [Offline-Modus](#offline-modus)
 - [Selbst bauen](#selbst-bauen)
 - [Tech-Stack](#tech-stack)
 - [Feedback](#feedback)
@@ -27,16 +26,35 @@
 
 ## Quick Start
 
-### 1. API-Key holen (kostenlos, 30 Sekunden)
+### 1. Wähle deinen Modus
 
-Dikta braucht einen Groq-Key für Sprache-zu-Text und einen DeepSeek-Key für Text-Bereinigung.
+<table>
+<tr>
+<td width="50%">
+
+**☁️ Cloud (empfohlen)**
+
+Beste Qualität, schnellste Ergebnisse. Nutzt Groq (Spracherkennung) und DeepSeek (Text-Bereinigung) über deine eigenen API-Keys — kein Dikta-Server dazwischen.
 
 | Provider | Wofür | Kosten | Key holen |
 |----------|-------|--------|-----------|
-| **Groq** | Spracherkennung (Whisper) | Kostenloses Free-Tier | [console.groq.com](https://console.groq.com) |
+| **Groq** | Spracherkennung | Kostenloses Free-Tier | [console.groq.com](https://console.groq.com) |
 | **DeepSeek** | Text-Bereinigung | ~0,001 € pro Diktat | [platform.deepseek.com](https://platform.deepseek.com) |
 
-> **Was heißt "eigene Keys"?** Dikta leitet deine Sprache direkt an Groq/DeepSeek — kein Dikta-Server dazwischen. Du behältst die volle Kontrolle. Bei normalem Gebrauch (30-60 Diktate/Tag) kostet das unter 0,10 € pro Tag. Groq ist komplett kostenlos mit einem großzügigen Free-Tier.
+Bei normalem Gebrauch (30-60 Diktate/Tag) unter 0,10 € am Tag.
+
+</td>
+<td width="50%">
+
+**🔒 Offline (nur Windows)**
+
+Kein Account, kein API-Key, keine Daten verlassen deinen Rechner. Spracherkennung läuft lokal über whisper.cpp (~500 MB Modell-Download beim ersten Start). Text-Cleanup wird übersprungen — du bekommst den Rohtext direkt.
+
+Ideal für: Datenschutz-sensible Umgebungen, kein Internet, oder einfach ausprobieren ohne Registrierung.
+
+</td>
+</tr>
+</table>
 
 ### 2. Installieren
 
@@ -86,12 +104,6 @@ Beim ersten Start führt dich ein **Einrichtungs-Wizard** durch alles: Cloud ode
 <tr><td><b>Paste überall</b></td><td>Einfügen über AccessibilityService in jedes Textfeld — WhatsApp, Mail, Browser, Notizen.</td></tr>
 <tr><td><b>Per-Geste konfigurierbar</b></td><td>Tap und Long-Press haben jeweils eigenen Modus (Hold/Toggle/Auto-Stop/Auto) und eigene Silence-Duration.</td></tr>
 </table>
-
----
-
-## Offline-Modus
-
-Dikta kann auch komplett ohne Internet laufen. Im Einrichtungs-Wizard "Offline" wählen — whisper.cpp läuft lokal auf deinem Rechner. Kein API-Key nötig, keine Daten verlassen deinen Computer. Text-Cleanup wird übersprungen (Rohtext direkt eingefügt).
 
 ---
 
