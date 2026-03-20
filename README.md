@@ -28,33 +28,18 @@
 
 ### 1. Wähle deinen Modus
 
-<table>
-<tr>
-<td width="50%">
+Dikta funktioniert in zwei Modi — du entscheidest beim ersten Start:
 
-**☁️ Cloud (empfohlen)**
+> **☁️ Cloud (empfohlen)** — Beste Qualität, schnellste Ergebnisse. Du brauchst zwei kostenlose API-Keys:
+>
+> | Provider | Wofür | Kosten | Key holen |
+> |----------|-------|--------|-----------|
+> | **Groq** | Spracherkennung | Kostenloses Free-Tier | [console.groq.com](https://console.groq.com) |
+> | **DeepSeek** | Text-Bereinigung | ~0,001 € pro Diktat | [platform.deepseek.com](https://platform.deepseek.com) |
+>
+> Deine Sprache geht direkt an Groq/DeepSeek — kein Dikta-Server dazwischen. Bei normalem Gebrauch unter 0,10 € am Tag.
 
-Beste Qualität, schnellste Ergebnisse. Nutzt Groq (Spracherkennung) und DeepSeek (Text-Bereinigung) über deine eigenen API-Keys — kein Dikta-Server dazwischen.
-
-| Provider | Wofür | Kosten | Key holen |
-|----------|-------|--------|-----------|
-| **Groq** | Spracherkennung | Kostenloses Free-Tier | [console.groq.com](https://console.groq.com) |
-| **DeepSeek** | Text-Bereinigung | ~0,001 € pro Diktat | [platform.deepseek.com](https://platform.deepseek.com) |
-
-Bei normalem Gebrauch (30-60 Diktate/Tag) unter 0,10 € am Tag.
-
-</td>
-<td width="50%">
-
-**🔒 Offline (nur Windows)**
-
-Kein Account, kein API-Key, keine Daten verlassen deinen Rechner. Spracherkennung läuft lokal über whisper.cpp (~500 MB Modell-Download beim ersten Start). Text-Cleanup wird übersprungen — du bekommst den Rohtext direkt.
-
-Ideal für: Datenschutz-sensible Umgebungen, kein Internet, oder einfach ausprobieren ohne Registrierung.
-
-</td>
-</tr>
-</table>
+> **🔒 Offline (nur Windows)** — Kein Account, kein API-Key, keine Daten verlassen deinen Rechner. Spracherkennung läuft lokal über whisper.cpp (~500 MB Modell-Download beim ersten Start). Text-Cleanup wird übersprungen — du bekommst den Rohtext direkt. Ideal zum Ausprobieren ohne Registrierung.
 
 ### 2. Installieren
 
