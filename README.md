@@ -18,6 +18,7 @@
 - [Was Dikta kann](#was-dikta-kann)
 - [Windows](#windows)
 - [Android](#android)
+- [Provider-Übersicht](#provider-übersicht)
 - [Tech-Stack](#tech-stack)
 - [Feedback](#feedback)
 
@@ -29,16 +30,22 @@
 
 Dikta funktioniert in zwei Modi — du entscheidest beim ersten Start:
 
-**☁️ Cloud (empfohlen)** — Beste Qualität, schnellste Ergebnisse. Du brauchst zwei API-Keys:
+**☁️ Cloud (empfohlen)** — Beste Qualität, schnellste Ergebnisse.
 
-| Provider | Wofür | Kosten | Key holen |
-|----------|-------|--------|-----------|
-| **Groq** | Spracherkennung | Kostenloses Free-Tier (mit Nutzungslimit) | [console.groq.com](https://console.groq.com) |
-| **DeepSeek** | Text-Bereinigung | ~0,001 € pro Diktat | [platform.deepseek.com](https://platform.deepseek.com) |
+Du brauchst mindestens einen **Groq API-Key** — damit funktioniert sowohl Spracherkennung als auch Text-Bereinigung. Groq ist kostenlos nutzbar; bei intensiver Nutzung kann ein kurzes Limit greifen.
 
-Deine Sprache geht direkt an Groq/DeepSeek — kein Dikta-Server dazwischen. Bei normalem Gebrauch unter 0,10 € am Tag. Groq ist kostenlos nutzbar; bei intensiver Nutzung kann ein kurzes Limit greifen.
+Für bessere Cleanup-Qualität empfehlen wir zusätzlich einen **DeepSeek API-Key** (~0,001 € pro Diktat). Weitere Provider (OpenAI, OpenRouter) lassen sich in den Settings konfigurieren.
 
-**🔒 Offline (nur Windows)** — Kein Account, kein API-Key, keine Daten verlassen deinen Rechner. Spracherkennung läuft lokal über whisper.cpp (~500 MB Modell-Download beim ersten Start). Text-Cleanup wird übersprungen — du bekommst den Rohtext direkt. Ideal zum Ausprobieren ohne Registrierung.
+| Was du brauchst | Key holen |
+|----------------|-----------|
+| **Groq** (Pflicht) — Spracherkennung + Cleanup, kostenloses Free-Tier mit Limit | [console.groq.com](https://console.groq.com) |
+| **DeepSeek** (empfohlen) — Besseres Cleanup, ~0,001 € pro Diktat | [platform.deepseek.com](https://platform.deepseek.com) |
+
+Deine Sprache geht direkt an die Provider — kein Dikta-Server dazwischen. Bei normalem Gebrauch (30-60 Diktate/Tag) unter 0,10 € am Tag.
+
+**🔒 Offline (nur Windows)** — Kein Account, kein API-Key, keine Daten verlassen deinen Rechner.
+
+Spracherkennung läuft lokal über whisper.cpp (~500 MB Modell-Download beim ersten Start). Text-Cleanup wird übersprungen — du bekommst den Rohtext direkt. Ideal zum Ausprobieren ohne Registrierung oder für datenschutz-sensible Umgebungen.
 
 ### 2. Installieren
 
@@ -78,6 +85,7 @@ Beim ersten Start führt dich ein **Einrichtungs-Wizard** durch alles: Cloud ode
 <tr><td><b>System Tray</b></td><td>Schnellzugriff über das Tray-Icon. Dikta läuft im Hintergrund.</td></tr>
 <tr><td><b>Paste überall</b></td><td>Ergebnis wird automatisch per Ctrl+V ins aktive Fenster eingefügt — Browser, Editor, Chat, Terminal.</td></tr>
 <tr><td><b>Whisper Mode</b></td><td>Audio-Verstärkung für leises Diktieren (z.B. im Büro).</td></tr>
+<tr><td><b>Offline-Modus</b></td><td>Spracherkennung lokal über whisper.cpp — kein Internet nötig, keine Daten verlassen den Rechner.</td></tr>
 </table>
 
 ## Android
@@ -88,6 +96,31 @@ Beim ersten Start führt dich ein **Einrichtungs-Wizard** durch alles: Cloud ode
 <tr><td><b>Paste überall</b></td><td>Einfügen über AccessibilityService in jedes Textfeld — WhatsApp, Mail, Browser, Notizen.</td></tr>
 <tr><td><b>Per-Geste konfigurierbar</b></td><td>Tap und Long-Press haben jeweils eigenen Modus und eigene Einstellungen.</td></tr>
 </table>
+
+---
+
+## Provider-Übersicht
+
+Dikta unterstützt mehrere Provider für Spracherkennung (STT) und Text-Bereinigung (LLM). Du wählst in den Settings, welche du nutzen möchtest.
+
+### Spracherkennung (STT)
+
+| Provider | Plattform | Kosten | Besonderheit |
+|----------|-----------|--------|-------------|
+| **Groq Whisper** | Windows, Android | Kostenloses Free-Tier (mit Limit) | Schnell, empfohlen |
+| **OpenAI Whisper** | nur Windows | ~0,006 €/min | Alternative bei Groq-Limit |
+| **whisper.cpp (lokal)** | nur Windows | Kostenlos | Offline, ~500 MB Modell |
+
+### Text-Bereinigung (LLM)
+
+| Provider | Plattform | Kosten | Besonderheit |
+|----------|-----------|--------|-------------|
+| **DeepSeek** | Windows, Android | ~0,001 €/Diktat | Beste Qualität/Preis, empfohlen |
+| **Groq (Llama)** | Windows, Android | Kostenloses Free-Tier (mit Limit) | Reicht als einziger Key |
+| **OpenAI** | Windows, Android | ~0,01 €/Diktat | Premium-Alternative |
+| **OpenRouter** | Windows, Android | variabel | Zugang zu vielen Modellen (experimentell) |
+
+Wenn der gewählte Provider keinen Key hat, schaltet Dikta automatisch auf den nächsten verfügbaren um.
 
 ---
 
@@ -103,7 +136,7 @@ Beim ersten Start führt dich ein **Einrichtungs-Wizard** durch alles: Cloud ode
 | Backend | Rust | Niedrige Latenz, native OS-APIs, whisper.cpp-Integration |
 | Mobile | Tauri v2 Android + Kotlin | Floating Bubble, native Audio, AccessibilityService |
 | STT | Groq Whisper API, whisper.cpp (offline) | Schnell, kostenlos / offline-fähig |
-| Text-Cleanup | DeepSeek (primär), OpenAI, Groq (konfigurierbar) | DeepSeek ist günstigster Provider |
+| Text-Cleanup | DeepSeek, Groq, OpenAI, OpenRouter | Multi-Provider, Auto-Fallback |
 | Speicherung | JSON (Config), SQLite (History, Stats) | Einfach, kein Server nötig |
 
 </details>
