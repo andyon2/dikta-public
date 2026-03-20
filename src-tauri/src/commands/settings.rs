@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use tauri::{AppHandle, State};
+use reqwest;
 
 use crate::config::{self, save_config, AppConfig, HotkeyMode};
 use crate::license::LicensedFeature;
@@ -169,6 +170,7 @@ pub async fn save_settings(
     bubble_long_press_mode: Option<String>,
     bubble_long_press_auto_send: Option<bool>,
     bubble_long_press_silence_secs: Option<f32>,
+    openrouter_api_key: Option<String>,
 ) -> Result<(), String> {
     let inner = state.inner();
 
@@ -233,6 +235,10 @@ pub async fn save_settings(
         anthropic_api_key: match anthropic_api_key {
             Some(ref k) if !k.is_empty() => k.clone(),
             _ => existing.anthropic_api_key,
+        },
+        openrouter_api_key: match openrouter_api_key {
+            Some(ref k) if !k.is_empty() => k.clone(),
+            _ => existing.openrouter_api_key,
         },
         stt_provider: stt_provider.unwrap_or(existing.stt_provider),
         llm_provider: llm_provider.unwrap_or(existing.llm_provider),
@@ -313,6 +319,7 @@ pub async fn save_settings(
             .unwrap_or(existing.bubble_long_press_auto_send),
         bubble_long_press_silence_secs: bubble_long_press_silence_secs
             .unwrap_or(existing.bubble_long_press_silence_secs),
+        onboarding: existing.onboarding,
     };
 
     // Resolve providers from the new config before persisting.
@@ -387,6 +394,7 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<SettingsView, String> 
         whisper_mode: cfg.whisper_mode,
         openai_api_key_masked: mask_api_key(&cfg.openai_api_key),
         anthropic_api_key_masked: mask_api_key(&cfg.anthropic_api_key),
+        openrouter_api_key_masked: mask_api_key(&cfg.openrouter_api_key),
         stt_provider: cfg.stt_provider,
         llm_provider: cfg.llm_provider,
         output_language: cfg.output_language,
@@ -669,6 +677,86 @@ pub fn set_hotkey_paused(state: State<'_, AppState>, paused: bool) {
         .hotkey_paused
         .store(paused, std::sync::atomic::Ordering::SeqCst);
     log::debug!("[settings] hotkey_paused = {paused}");
+}
+
+// ---------------------------------------------------------------------------
+// Onboarding commands
+// ---------------------------------------------------------------------------
+
+/// Returns the current onboarding wizard state.
+///
+/// The frontend reads this on startup to decide whether to show the wizard,
+/// resume from a saved step, or skip it entirely.
+#[tauri::command]
+pub fn get_onboarding_state(
+    state: State<'_, AppState>,
+) -> Result<crate::config::OnboardingState, String> {
+    let cfg = crate::lock!(state.inner().config)?;
+    Ok(cfg.onboarding.clone())
+}
+
+/// Updates the onboarding wizard state in-memory and persists it to disk.
+///
+/// The frontend calls this after each wizard step so progress survives a
+/// restart. Overwrites the entire `onboarding` sub-object -- the frontend
+/// always passes the complete current state.
+#[tauri::command]
+pub fn set_onboarding_state(
+    state: State<'_, AppState>,
+    onboarding_state: crate::config::OnboardingState,
+) -> Result<(), String> {
+    let inner = state.inner();
+    let mut cfg = crate::lock!(inner.config)?;
+    cfg.onboarding = onboarding_state;
+    let cfg_clone = cfg.clone();
+    drop(cfg); // release lock before I/O
+    save_config(&inner.app_data_dir, &cfg_clone)
+        .map_err(|e| format!("Failed to save onboarding state: {e}"))
+}
+
+/// Validates an API key by making a minimal authenticated request to the
+/// provider's models endpoint.
+///
+/// Returns:
+/// - `Ok(true)`  — HTTP 200: key is valid and accepted.
+/// - `Ok(false)` — HTTP 401/403: key is invalid or lacks permissions.
+/// - `Err(msg)`  — Network error, timeout, or unexpected HTTP status.
+///
+/// Supported providers: `"groq"`, `"openai"`, `"deepseek"`, `"openrouter"`.
+/// Unknown provider strings return `Err`.
+///
+/// This command takes the provider name and key directly as parameters so
+/// it can be called before any key is persisted (e.g. while the user is
+/// still typing in the wizard).
+#[tauri::command]
+pub async fn validate_api_key(provider: String, key: String) -> Result<bool, String> {
+    let url = match provider.as_str() {
+        "groq"       => "https://api.groq.com/openai/v1/models",
+        "openai"     => "https://api.openai.com/v1/models",
+        "deepseek"   => "https://api.deepseek.com/v1/models",
+        "openrouter" => "https://openrouter.ai/api/v1/models",
+        other => {
+            return Err(format!("Unknown provider: {other:?}. Supported: groq, openai, deepseek, openrouter"));
+        }
+    };
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .get(url)
+        .bearer_auth(&key)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("Network error while validating {provider} key: {e}"))?;
+
+    match response.status().as_u16() {
+        200 => Ok(true),
+        401 | 403 => Ok(false),
+        other => Err(format!(
+            "Unexpected HTTP {other} from {provider} validation endpoint"
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------

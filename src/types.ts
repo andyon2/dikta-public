@@ -40,6 +40,7 @@ export interface AppSettings {
   whisperMode: boolean;
   openaiApiKeyMasked: string;
   anthropicApiKeyMasked: string;
+  openrouterApiKeyMasked: string;
   sttProvider: string;
   llmProvider: string;
   // Deprecated: use sttProvider / llmProvider instead.
@@ -111,6 +112,15 @@ export interface UsageSummary {
   totalLlmCostUsd: number;
   dictationsToday: number;
   costTodayUsd: number;
+}
+
+// Onboarding wizard state -- persisted in config.json via set_onboarding_state.
+export interface OnboardingState {
+  completed: boolean;
+  skipped: boolean;
+  currentStep: number;   // 0 = not started
+  mode: string;          // "cloud" | "offline" | ""
+  language: string;      // ISO-639-1, e.g. "de", "" = not set
 }
 
 // App-level state shape.

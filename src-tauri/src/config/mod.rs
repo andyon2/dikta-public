@@ -414,6 +414,34 @@ fn default_hotkey_slots() -> Vec<HotkeySlot> {
 // Configuration struct
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// OnboardingState
+// ---------------------------------------------------------------------------
+
+/// Tracks the user's progress through the first-run onboarding wizard.
+///
+/// Persisted as part of `AppConfig` so the wizard survives app restarts.
+/// All fields default to "not started" via `Default`.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OnboardingState {
+    /// `true` when the user has completed the wizard successfully.
+    pub completed: bool,
+    /// `true` when the user explicitly clicked "Skip" on the wizard.
+    pub skipped: bool,
+    /// The last step the user reached. 0 = not started.
+    pub current_step: u8,
+    /// Chosen operating mode. One of `"cloud"`, `"offline"`, or `""` (not chosen yet).
+    pub mode: String,
+    /// Chosen input language. ISO-639-1 code (e.g. `"de"`, `"en"`).
+    /// Empty string = not chosen yet.
+    pub language: String,
+}
+
+// ---------------------------------------------------------------------------
+// AppConfig
+// ---------------------------------------------------------------------------
+
 /// Persisted application settings.
 ///
 /// All fields have defaults via `Default` so a partially-written or
@@ -436,6 +464,10 @@ pub struct AppConfig {
     /// Anthropic API key (used for LLM provider only).
     #[serde(default)]
     pub anthropic_api_key: String,
+
+    /// OpenRouter API key (OpenAI-compatible gateway for multi-provider routing).
+    #[serde(default, rename = "openrouterApiKey")]
+    pub openrouter_api_key: String,
 
     /// Selected STT provider.
     /// Valid values: `"groq"`, `"openai"`, `"local"`.
@@ -709,6 +741,14 @@ pub struct AppConfig {
     /// when triggered by a bubble long press. Default: 2.0 seconds.
     #[serde(default = "default_bubble_silence_secs")]
     pub bubble_long_press_silence_secs: f32,
+
+    /// Onboarding wizard state.
+    ///
+    /// Tracks whether the user has completed, skipped, or is partway through
+    /// the first-run setup wizard. Uses `#[serde(default)]` so old config
+    /// files (without this field) load correctly -- they get `OnboardingState::default()`.
+    #[serde(default)]
+    pub onboarding: OnboardingState,
 }
 
 fn default_stt_provider() -> String {
@@ -804,6 +844,7 @@ impl Default for AppConfig {
             deepseek_api_key: String::new(),
             openai_api_key: String::new(),
             anthropic_api_key: String::new(),
+            openrouter_api_key: String::new(),
             stt_provider: default_stt_provider(),
             llm_provider: default_llm_provider(),
             stt_priority: Vec::new(),
@@ -846,6 +887,7 @@ impl Default for AppConfig {
             bubble_long_press_mode: default_bubble_long_press_mode(),
             bubble_long_press_auto_send: false,
             bubble_long_press_silence_secs: default_bubble_silence_secs(),
+            onboarding: OnboardingState::default(),
         }
     }
 }
@@ -1068,7 +1110,7 @@ pub fn load_config(app_data_dir: &Path) -> AppConfig {
     // Validation: reject unknown provider values and fall back to defaults.
     // ---------------------------------------------------------------------------
     const VALID_STT_PROVIDERS: &[&str] = &["groq", "openai", "local"];
-    const VALID_LLM_PROVIDERS: &[&str] = &["deepseek", "openai", "anthropic", "groq"];
+    const VALID_LLM_PROVIDERS: &[&str] = &["deepseek", "openai", "anthropic", "groq", "openrouter"];
 
     if !VALID_STT_PROVIDERS.contains(&config.stt_provider.as_str()) {
         log::warn!(
@@ -1101,20 +1143,22 @@ pub fn load_config(app_data_dir: &Path) -> AppConfig {
     // clear error at runtime when they actually trigger cleanup.
     // ---------------------------------------------------------------------------
     let current_key_empty = match config.llm_provider.as_str() {
-        "deepseek"  => config.deepseek_api_key.is_empty(),
-        "openai"    => config.openai_api_key.is_empty(),
-        "anthropic" => config.anthropic_api_key.is_empty(),
-        "groq"      => config.groq_api_key.is_empty(),
-        _           => false, // already validated above; unreachable in practice
+        "deepseek"    => config.deepseek_api_key.is_empty(),
+        "openai"      => config.openai_api_key.is_empty(),
+        "anthropic"   => config.anthropic_api_key.is_empty(),
+        "groq"        => config.groq_api_key.is_empty(),
+        "openrouter"  => config.openrouter_api_key.is_empty(),
+        _             => false, // already validated above; unreachable in practice
     };
 
     if current_key_empty {
         // Walk the preference list and pick the first provider that has a key.
         let candidates: &[(&str, &str)] = &[
-            ("deepseek",  &config.deepseek_api_key),
-            ("openai",    &config.openai_api_key),
-            ("groq",      &config.groq_api_key),
-            ("anthropic", &config.anthropic_api_key),
+            ("deepseek",   &config.deepseek_api_key),
+            ("openai",     &config.openai_api_key),
+            ("groq",       &config.groq_api_key),
+            ("anthropic",  &config.anthropic_api_key),
+            ("openrouter", &config.openrouter_api_key),
         ];
         if let Some((name, _)) = candidates
             .iter()
@@ -1311,6 +1355,8 @@ mod tests {
             bubble_long_press_mode: "hold".to_string(),
             bubble_long_press_auto_send: false,
             bubble_long_press_silence_secs: 1.5,
+            openrouter_api_key: "sk-or-test-key".to_string(),
+            onboarding: OnboardingState::default(),
         };
 
         save_config(dir.path(), &original).expect("save should succeed");

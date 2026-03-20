@@ -132,6 +132,8 @@ pub struct SettingsView {
     pub openai_api_key_masked: String,
     /// Masked Anthropic API key.
     pub anthropic_api_key_masked: String,
+    /// Masked OpenRouter API key.
+    pub openrouter_api_key_masked: String,
     /// Selected STT provider: "groq", "openai", or "local".
     pub stt_provider: String,
     /// Selected LLM cleanup provider: "deepseek", "openai", "anthropic", or "groq".
@@ -435,8 +437,8 @@ pub fn friendly_error(context: &str, err: &str) -> String {
         || err.contains("invalid_api_key")
     {
         " Check your API key in Settings."
-    } else if err.contains("429") || err.contains("rate_limit") {
-        " Rate limit reached \u{2014} wait a moment and try again."
+    } else if err.contains("429") || err.contains("rate_limit") || err.contains("Rate limit") {
+        " Groq Free-Tier-Limit erreicht \u{2014} warte einen Moment und versuche es erneut."
     } else if err.contains("timeout") || err.contains("timed out") {
         " Request timed out \u{2014} check your internet connection."
     } else if err.contains("connection") || err.contains("ConnectError") {
@@ -830,6 +832,10 @@ pub fn run() {
             commands::settings::set_hotkey_paused,
             commands::settings::get_advanced_settings,
             commands::settings::save_advanced_settings,
+            // Onboarding
+            commands::settings::get_onboarding_state,
+            commands::settings::set_onboarding_state,
+            commands::settings::validate_api_key,
             // Dictionary
             commands::dictionary::get_dictionary_terms,
             commands::dictionary::add_dictionary_term,
@@ -844,6 +850,8 @@ pub fn run() {
             commands::history::get_filler_stats,
             commands::history::get_notes,
             commands::history::save_note,
+            commands::history::is_tip_shown,
+            commands::history::mark_tip_shown,
             // Misc: profiles, snippets, sync, paste, UI helpers
             commands::misc::get_profiles,
             commands::misc::save_profiles,
@@ -952,6 +960,7 @@ mod tests {
             whisper_mode: false,
             openai_api_key_masked: String::new(),
             anthropic_api_key_masked: String::new(),
+            openrouter_api_key_masked: String::new(),
             stt_provider: "groq".to_string(),
             llm_provider: "deepseek".to_string(),
             output_language: String::new(),
@@ -1006,6 +1015,7 @@ mod tests {
             whisper_mode: false,
             openai_api_key_masked: String::new(),
             anthropic_api_key_masked: String::new(),
+            openrouter_api_key_masked: String::new(),
             stt_provider: "groq".to_string(),
             llm_provider: "deepseek".to_string(),
             output_language: String::new(),
@@ -1054,6 +1064,7 @@ mod tests {
             whisper_mode: false,
             openai_api_key_masked: String::new(),
             anthropic_api_key_masked: String::new(),
+            openrouter_api_key_masked: String::new(),
             stt_provider: "groq".to_string(),
             llm_provider: "deepseek".to_string(),
             output_language: String::new(),

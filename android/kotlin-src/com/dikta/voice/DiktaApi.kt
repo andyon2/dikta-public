@@ -13,11 +13,26 @@ import java.util.concurrent.Callable
 import java.util.concurrent.Executors
 
 /**
- * API client for Groq Whisper STT and DeepSeek text cleanup.
+ * Resolved LLM provider: URL, model name, and API key.
+ * All three supported providers (DeepSeek, Groq, OpenAI) use the OpenAI-compatible
+ * chat completions format, so the same request body works for all.
+ */
+data class LlmProviderInfo(
+    val url: String,
+    val model: String,
+    val apiKey: String
+)
+
+/**
+ * API client for Groq Whisper STT and LLM text cleanup.
  * Uses java.net.HttpURLConnection -- no extra dependencies needed.
  * All methods throw IOException on failure -- caller handles errors.
  */
 object DiktaApi {
+
+    // Set to true after the first successful ensureRemoteTable() call.
+    // Avoids an extra HTTP roundtrip on every subsequent Turso push.
+    private var remoteTableEnsured = false
 
     data class Config(
         val groqApiKey: String,
@@ -37,8 +52,80 @@ object DiktaApi {
         val bubbleTapSilenceSecs: Float = 2.0f,
         val bubbleLongPressMode: String = "hold",
         val bubbleLongPressAutoSend: Boolean = false,
-        val bubbleLongPressSilenceSecs: Float = 2.0f
+        val bubbleLongPressSilenceSecs: Float = 2.0f,
+        // LLM provider selection: "deepseek" (default), "groq", "openai", or "openrouter"
+        val llmProvider: String = "deepseek",
+        val openaiApiKey: String = "",
+        val openrouterApiKey: String = ""
     )
+
+    /**
+     * Resolves the active LLM provider for cleanup calls.
+     *
+     * Priority:
+     *   1. The provider named in config.llmProvider, if it has an API key configured.
+     *   2. Auto-fallback: tries deepseek -> groq -> openai in that order.
+     *      Logs a warning when falling back.
+     *   3. Returns null if no provider has a key -- caller must skip cleanup.
+     *
+     * All three providers use the OpenAI-compatible chat completions format.
+     * Anthropic is NOT supported (different request format).
+     */
+    fun resolveLlmProvider(config: Config): LlmProviderInfo? {
+        // Try the configured provider first.
+        val primary: LlmProviderInfo? = when (config.llmProvider) {
+            "groq" -> if (config.groqApiKey.isNotBlank()) LlmProviderInfo(
+                url    = "https://api.groq.com/openai/v1/chat/completions",
+                model  = "llama-3.3-70b-versatile",
+                apiKey = config.groqApiKey
+            ) else null
+            "openai" -> if (config.openaiApiKey.isNotBlank()) LlmProviderInfo(
+                url    = "https://api.openai.com/v1/chat/completions",
+                model  = "gpt-4o-mini",
+                apiKey = config.openaiApiKey
+            ) else null
+            "openrouter" -> if (config.openrouterApiKey.isNotBlank()) LlmProviderInfo(
+                url    = "https://openrouter.ai/api/v1/chat/completions",
+                model  = "deepseek/deepseek-chat",
+                apiKey = config.openrouterApiKey
+            ) else null
+            else -> if (config.deepseekApiKey.isNotBlank()) LlmProviderInfo(
+                url    = "https://api.deepseek.com/chat/completions",
+                model  = "deepseek-chat",
+                apiKey = config.deepseekApiKey
+            ) else null
+        }
+
+        if (primary != null) return primary
+
+        // Configured provider has no key -- try fallbacks in priority order.
+        val fallbacks = listOf(
+            Triple("deepseek", config.deepseekApiKey, LlmProviderInfo(
+                url    = "https://api.deepseek.com/chat/completions",
+                model  = "deepseek-chat",
+                apiKey = config.deepseekApiKey
+            )),
+            Triple("groq", config.groqApiKey, LlmProviderInfo(
+                url    = "https://api.groq.com/openai/v1/chat/completions",
+                model  = "llama-3.3-70b-versatile",
+                apiKey = config.groqApiKey
+            )),
+            Triple("openai", config.openaiApiKey, LlmProviderInfo(
+                url    = "https://api.openai.com/v1/chat/completions",
+                model  = "gpt-4o-mini",
+                apiKey = config.openaiApiKey
+            )),
+            Triple("openrouter", config.openrouterApiKey, LlmProviderInfo(
+                "https://openrouter.ai/api/v1/chat/completions",
+                "deepseek/deepseek-chat",
+                config.openrouterApiKey
+            ))
+        )
+        return fallbacks.firstOrNull { it.second.isNotBlank() }?.let {
+            Log.i("DiktaApi", "LLM provider '${config.llmProvider}' has no key, falling back to '${it.first}'")
+            it.third
+        }
+    }
 
     /**
      * Returns the app's data directory path.
@@ -83,14 +170,19 @@ object DiktaApi {
             val bubbleLongPressMode = json.optString("bubbleLongPressMode", "hold")
             val bubbleLongPressAutoSend = json.optBoolean("bubbleLongPressAutoSend", false)
             val bubbleLongPressSilenceSecs = json.optDouble("bubbleLongPressSilenceSecs", 2.0).toFloat()
-            Log.d("DiktaApi", "readConfig: bubbleTapMode=$bubbleTapMode, bubbleLongPressMode=$bubbleLongPressMode, json has keys: ${json.keys().asSequence().filter { it.contains("bubble", ignoreCase = true) }.toList()}")
+            val llmProvider = json.optString("llmProvider", "deepseek")
+            val openaiApiKey = json.optString("openaiApiKey", "")
+            val openrouterApiKey = json.optString("openrouterApiKey", "")
+            Log.d("DiktaApi", "readConfig: bubbleTapMode=$bubbleTapMode, bubbleLongPressMode=$bubbleLongPressMode, llmProvider=$llmProvider, json has keys: ${json.keys().asSequence().filter { it.contains("bubble", ignoreCase = true) }.toList()}")
 
-            if (groqKey.isBlank() && deepseekKey.isBlank()) null
+            // Require at least a Groq key for STT; LLM key is optional (cleanup is skipped if absent).
+            if (groqKey.isBlank()) null
             else Config(
                 groqKey, deepseekKey, language, cleanupStyle, tursoUrl, tursoToken, deviceId,
                 bubbleSize, bubbleOpacity, bubbleRecordingMode,
                 bubbleTapMode, bubbleTapAutoSend, bubbleTapSilenceSecs,
-                bubbleLongPressMode, bubbleLongPressAutoSend, bubbleLongPressSilenceSecs
+                bubbleLongPressMode, bubbleLongPressAutoSend, bubbleLongPressSilenceSecs,
+                llmProvider, openaiApiKey, openrouterApiKey
             )
         } catch (e: Exception) {
             null
@@ -197,7 +289,12 @@ object DiktaApi {
             val httpsUrl = tursoUrl.replace("libsql://", "https://")
 
             // Ensure the remote table exists before inserting rows.
-            ensureRemoteTable(httpsUrl, tursoToken)
+            // Only runs once per app session -- the flag avoids a redundant HTTP roundtrip
+            // on every subsequent push.
+            if (!remoteTableEnsured) {
+                ensureRemoteTable(httpsUrl, tursoToken)
+                remoteTableEnsured = true
+            }
 
             val requests = JSONArray()
             val uuids = mutableListOf<String>()
@@ -341,15 +438,16 @@ object DiktaApi {
     }
 
     /**
-     * Cleans up dictation text using DeepSeek chat API.
+     * Cleans up dictation text using an OpenAI-compatible chat completions API.
+     * Supports DeepSeek, Groq, and OpenAI -- all use the same request format.
      *
-     * @param text   Raw transcription text to clean up
-     * @param apiKey DeepSeek API key
-     * @param style  Cleanup style: "polished", "verbatim", or "chat"
+     * @param text     Raw transcription text to clean up
+     * @param provider Resolved LLM provider (URL, model, API key)
+     * @param style    Cleanup style: "polished", "verbatim", or "chat"
      * @return Cleaned text
      * @throws IOException on network or API errors
      */
-    fun cleanup(text: String, apiKey: String, style: String): String {
+    fun cleanup(text: String, provider: LlmProviderInfo, style: String): String {
         val systemPrompt = when (style) {
             "verbatim" -> """You are a minimal text cleanup assistant. The user gives you raw speech-to-text output. Apply ONLY these changes:
 - Remove filler words (um, uh, like, you know / äh, ähm, also, halt, sozusagen, quasi)
@@ -397,7 +495,7 @@ STRICT RULES:
 - Output ONLY the cleaned text, no explanations"""
         }
 
-        val url = URL("https://api.deepseek.com/chat/completions")
+        val url = URL(provider.url)
         val conn = url.openConnection() as HttpURLConnection
 
         try {
@@ -405,7 +503,7 @@ STRICT RULES:
             conn.doOutput = true
             conn.connectTimeout = 15_000
             conn.readTimeout = 30_000
-            conn.setRequestProperty("Authorization", "Bearer $apiKey")
+            conn.setRequestProperty("Authorization", "Bearer ${provider.apiKey}")
             conn.setRequestProperty("Content-Type", "application/json")
 
             val messages = JSONArray().apply {
@@ -420,7 +518,7 @@ STRICT RULES:
             }
 
             val requestBody = JSONObject().apply {
-                put("model", "deepseek-chat")
+                put("model", provider.model)
                 put("messages", messages)
                 put("temperature", 0.3)
             }.toString().toByteArray(Charsets.UTF_8)
@@ -431,7 +529,7 @@ STRICT RULES:
             val responseCode = conn.responseCode
             if (responseCode != 200) {
                 val errorBody = conn.errorStream?.bufferedReader()?.readText() ?: "unknown error"
-                throw IOException("DeepSeek cleanup failed: HTTP $responseCode -- $errorBody")
+                throw IOException("LLM cleanup failed (${provider.model}): HTTP $responseCode -- $errorBody")
             }
 
             val responseText = conn.inputStream.bufferedReader().readText()
@@ -505,7 +603,8 @@ STRICT RULES:
     }
 
     /**
-     * Cleans up text using the DeepSeek API, with chunked parallel processing for long texts.
+     * Cleans up text using an OpenAI-compatible LLM API, with chunked parallel processing
+     * for long texts.
      *
      * - If text.length <= CHUNK_THRESHOLD: delegates to [cleanup] (single call).
      * - If text.length > CHUNK_THRESHOLD: splits into chunks via [splitIntoChunks] and
@@ -513,28 +612,28 @@ STRICT RULES:
      *   Results are joined with "\n\n".
      *   If any chunk fails, falls back to a single [cleanup] call on the full text.
      *
-     * @param text   Raw transcription text to clean up
-     * @param apiKey DeepSeek API key
-     * @param style  Cleanup style: "polished", "verbatim", or "chat"
+     * @param text     Raw transcription text to clean up
+     * @param provider Resolved LLM provider (URL, model, API key)
+     * @param style    Cleanup style: "polished", "verbatim", or "chat"
      * @return Cleaned text
      * @throws IOException if both chunked and fallback calls fail
      */
-    fun cleanupChunked(text: String, apiKey: String, style: String): String {
+    fun cleanupChunked(text: String, provider: LlmProviderInfo, style: String): String {
         if (text.length <= CHUNK_THRESHOLD) {
-            return cleanup(text, apiKey, style)
+            return cleanup(text, provider, style)
         }
 
         val chunks = splitIntoChunks(text)
         if (chunks.size <= 1) {
-            return cleanup(text, apiKey, style)
+            return cleanup(text, provider, style)
         }
 
-        Log.i(CLEANUP_TAG, "[cleanupChunked] splitting ${text.length} chars into ${chunks.size} chunks")
+        Log.i(CLEANUP_TAG, "[cleanupChunked] splitting ${text.length} chars into ${chunks.size} chunks (${provider.model})")
 
         val executor = Executors.newFixedThreadPool(4)
         try {
             val futures = chunks.map { chunk ->
-                executor.submit(Callable { cleanup(chunk, apiKey, style) })
+                executor.submit(Callable { cleanup(chunk, provider, style) })
             }
 
             // Collect results -- if any Future throws, we fall through to the catch block.
@@ -542,7 +641,7 @@ STRICT RULES:
                 futures.map { it.get() }
             } catch (e: Exception) {
                 Log.w(CLEANUP_TAG, "[cleanupChunked] a chunk failed, falling back to single call", e)
-                return cleanup(text, apiKey, style)
+                return cleanup(text, provider, style)
             }
 
             return results.joinToString("\n\n")

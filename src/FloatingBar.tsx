@@ -6,7 +6,6 @@ import type { RecordingState, HotkeyMode } from "./types";
 import {
   onStateChanged,
   setBarShape,
-  transcribeLivePreview,
   cancelRecording,
   saveBarPosition,
   getBarPosition,
@@ -42,12 +41,6 @@ const RESET_CSS = `
   }
   ::-webkit-scrollbar { display: none !important; width: 0 !important; height: 0 !important; }
 
-  @keyframes bar-bounce-0 { 0%,100%{transform:scaleY(0.15)} 50%{transform:scaleY(1)} }
-  @keyframes bar-bounce-1 { 0%,100%{transform:scaleY(0.15)} 50%{transform:scaleY(1)} }
-  @keyframes bar-bounce-2 { 0%,100%{transform:scaleY(0.15)} 50%{transform:scaleY(1)} }
-  @keyframes bar-bounce-3 { 0%,100%{transform:scaleY(0.15)} 50%{transform:scaleY(1)} }
-  @keyframes bar-bounce-4 { 0%,100%{transform:scaleY(0.15)} 50%{transform:scaleY(1)} }
-
   @keyframes spin {
     from { transform: rotate(0deg); }
     to   { transform: rotate(360deg); }
@@ -69,10 +62,6 @@ const RESET_CSS = `
     to   { transform: scale(0.85); opacity: 0; }
   }
 `;
-
-// Phase offsets per bar, spread evenly.
-const BAR_PHASE_DELAYS = [0, 0.2, 0.4, 0.6, 0.8];
-const BAR_ANIMATION_DURATION = 600;
 
 // ---------------------------------------------------------------------------
 // Sub-components
@@ -122,7 +111,7 @@ function DiktaLogo() {
   );
 }
 
-/** Animated waveform: 5 bars, soft color. */
+/** Real-time waveform: 5 bars driven by audio level events (~15 Hz). */
 function Waveform({ levels }: { levels: number[] }) {
   return (
     <div
@@ -139,7 +128,6 @@ function Waveform({ levels }: { levels: number[] }) {
         const levelIdx = Math.round((i / (BAR_COUNT - 1)) * (levels.length - 1));
         const amplitude = Math.max(0.12, levels[levelIdx] ?? 0);
         const heightPx = Math.max(3, amplitude * 19);
-        const delayMs = BAR_PHASE_DELAYS[i] * BAR_ANIMATION_DURATION;
         return (
           <div
             key={i}
@@ -148,10 +136,8 @@ function Waveform({ levels }: { levels: number[] }) {
               borderRadius: 9999,
               background: "rgba(147,197,253,0.85)",
               height: heightPx,
-              transformOrigin: "center",
-              animation: `bar-bounce-${i} ${BAR_ANIMATION_DURATION}ms ease-in-out ${delayMs}ms infinite`,
-              willChange: "transform",
-              transition: "height 75ms ease-out",
+              // No animation or transition: bars respond instantly to the
+              // 15 Hz audio-level events from the Rust backend.
             }}
           />
         );
@@ -248,7 +234,7 @@ export default function FloatingBar() {
   const [levels, setLevels] = useState<number[]>(new Array(20).fill(0));
   const [showDone, setShowDone] = useState(false);
   const [clipboardOnly, setClipboardOnly] = useState(false);
-  const [livePreview, setLivePreview] = useState("");
+  // const [livePreview, setLivePreview] = useState(""); // disabled: re-enable when preview becomes opt-in
   const [collapsing, setCollapsing] = useState(false);
   const [hotkeyMode, setHotkeyMode] = useState<HotkeyMode>("hold");
   const doneTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -384,27 +370,33 @@ export default function FloatingBar() {
   // --- Real-time audio level ring buffer ---
   useEffect(() => {
     const unlisten = listen<AudioLevelPayload>("dikta://audio-level", (event) => {
-      const raw = Math.min(1, event.payload.level * 2.8);
-      const boosted = Math.pow(raw, 0.6);
+      // Scale RMS to visual range. Typical speech RMS is 0.01–0.1.
+      // Multiplier of 10 maps 0.1 RMS to full scale (1.0).
+      // Power of 0.4 compresses the range so quiet speech is still visible.
+      const raw = Math.min(1, event.payload.level * 10);
+      const boosted = Math.pow(raw, 0.4);
       setLevels((prev) => [...prev.slice(1), boosted]);
     });
     return () => { unlisten.then((fn) => fn()); };
   }, []);
 
   // --- Live preview polling while recording ---
-  useEffect(() => {
-    if (!isRecording) {
-      setLivePreview("");
-      return;
-    }
-    const initialDelay = setTimeout(() => {
-      transcribeLivePreview().then((t) => { if (t) setLivePreview(t); }).catch(() => {});
-    }, 2000);
-    const interval = setInterval(() => {
-      transcribeLivePreview().then((t) => { if (t) setLivePreview(t); }).catch(() => {});
-    }, 3000);
-    return () => { clearTimeout(initialDelay); clearInterval(interval); };
-  }, [isRecording]);
+  // Disabled: causes 10-20x Groq API quota usage with no meaningful UX benefit.
+  // The waveform provides sufficient recording feedback. Re-enable via a
+  // settings flag if needed in the future.
+  // useEffect(() => {
+  //   if (!isRecording) {
+  //     setLivePreview("");
+  //     return;
+  //   }
+  //   const initialDelay = setTimeout(() => {
+  //     transcribeLivePreview().then((t) => { if (t) setLivePreview(t); }).catch(() => {});
+  //   }, 2000);
+  //   const interval = setInterval(() => {
+  //     transcribeLivePreview().then((t) => { if (t) setLivePreview(t); }).catch(() => {});
+  //   }, 3000);
+  //   return () => { clearTimeout(initialDelay); clearInterval(interval); };
+  // }, [isRecording]);
 
   // --- Manual drag via mouse events + setPosition() ---
   // Tauri's startDragging() and data-tauri-drag-region don't work reliably
@@ -520,26 +512,7 @@ export default function FloatingBar() {
         {isRecording && (
           <>
             <StopButton onClick={() => { cancelRecording().catch(() => {}); }} />
-            {livePreview ? (
-              <span
-                style={{
-                  fontSize: 11,
-                  color: "#d4d4d8",
-                  flex: 1,
-                  minWidth: 0,
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
-                  direction: "rtl",
-                  textAlign: "left",
-                  lineHeight: 1,
-                }}
-              >
-                {livePreview}
-              </span>
-            ) : (
-              <Waveform levels={levels} />
-            )}
+            <Waveform levels={levels} />
             <span
               style={{
                 fontSize: 10,
